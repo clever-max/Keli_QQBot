@@ -1,0 +1,11 @@
+.env
+data/
+logs/
+run/
+.setup/
+NapCat/
+__pycache__/
+*.py[cod]
+.venv/
+# Local data backups, not source.
+*.zip

@@ -1,0 +1,367 @@
+"""Recall history: incremental cursor, image recovery and page rendering."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+import aiosqlite
+import httpx
+from nonebot import logger
+from nonebot.adapters.onebot.v11 import Bot, MessageSegment
+
+from ..common.card import CardEntry, page_size_for, paginate, render_card_page
+from ..core.config import (
+    GROUP_TIMEZONE,
+    MEDIA_CACHE_DIR,
+    RECALL_IMAGE_DIR,
+    RECALL_WINDOW_MINUTES,
+)
+from ..media.pipeline import (
+    avatar_dir,
+    cache_avatar,
+    cache_message_images,
+    cached_image_paths,
+    cached_image_paths_from_json,
+)
+from ..common.render import render_message
+from ..core.state import _avatar_warm_tasks, _recall_locks
+from ..common.bot_info import group_name_for
+from ..common.safety import guard
+from ..core.store import connect
+
+
+@dataclass(frozen=True)
+class RecallRequest:
+    """Who asked for recall records, about which group, and where they go.
+
+    ``private`` sends the cards to the requester's 1:1 chat with the bot
+    instead of into the group: OneBot/NapCat turn a private send that carries
+    ``group_id`` into a 群临时会话 for a non-friend, and into a plain private
+    message for a friend, so the requester receives it either way.
+
+    ``from_group`` is where the command was typed, which decides where text
+    notices go: a command typed in the group keeps its "nothing to show /
+    it failed" answers in the group, while a command typed in a private chat
+    is answered privately and never touches the group.
+    """
+
+    group_id: int
+    user_id: int
+    private: bool = False
+    from_group: bool = True
+    group_name: str = ""
+
+
+async def _deliver(bot: Bot, request: RecallRequest, message: Any, *, to_group: bool) -> Any:
+    if to_group:
+        return await bot.send_group_msg(group_id=request.group_id, message=message)
+    return await bot.send_private_msg(
+        user_id=request.user_id, group_id=request.group_id, message=message
+    )
+
+
+async def send_cards(bot: Bot, request: RecallRequest, message: Any) -> Any:
+    """Send one recall card image to wherever this request asked for."""
+    return await _deliver(bot, request, message, to_group=not request.private)
+
+
+async def send_notice(bot: Bot, request: RecallRequest, message: Any) -> Any:
+    """Send one text notice to the channel the command was typed in."""
+    return await _deliver(bot, request, message, to_group=request.from_group)
+
+
+def render_recall_page(
+    rows: list[Any], group_id: int, group_name: str, page: int, pages: int
+) -> Path:
+    """Describe the recalled rows to the shared card renderer."""
+    entries: list[CardEntry] = []
+    for row in rows:
+        try:
+            message_data = json.loads(row["message_json"])
+            has_image_segment = any(segment.get("type") == "image" for segment in message_data)
+            text = render_message(message_data, omit_images=True)
+        except (json.JSONDecodeError, TypeError):
+            text = str(row["plain_text"] or "[非文本消息]")
+            has_image_segment = "[图片]" in text
+            if has_image_segment:
+                text = text.replace("[图片]", "").strip()
+        image_paths = cached_image_paths(row)
+        shown_images = image_paths[:4]
+        entries.append(
+            CardEntry(
+                user_id=str(row["user_id"]),
+                name=str(row["sender_name"] or "群成员"),
+                right_text=datetime.fromisoformat(row["sent_at"])
+                .astimezone(GROUP_TIMEZONE)
+                .strftime("%Y-%m-%d %H:%M:%S"),
+                meta_text=datetime.fromisoformat(row["recalled_at"])
+                .astimezone(GROUP_TIMEZONE)
+                .strftime("撤回于 %H:%M:%S"),
+                text=text,
+                image_paths=shown_images,
+                image_note="图片暂不可用" if has_image_segment and not shown_images else "",
+                extra_images=max(0, len(image_paths) - len(shown_images)),
+            )
+        )
+    display_group_name = " ".join(str(group_name).split())[:28] or "本群"
+    return render_card_page(
+        "撤回记录",
+        f"{display_group_name}  ·  第 {page}/{pages} 页",
+        entries,
+        group_id=group_id,
+        directory=RECALL_IMAGE_DIR,
+    )
+
+
+async def clear_pending_recall(group_id: str) -> int:
+    lock = _recall_locks.setdefault(group_id, asyncio.Lock())
+    async with lock:
+        async with connect() as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO recall_cursor(group_id, last_event_id) VALUES (?, 0)",
+                (group_id,),
+            )
+            cursor = await db.execute(
+                """SELECT e.event_id, m.message_json FROM recall_events e
+                   LEFT JOIN messages m ON m.group_id=e.group_id AND m.message_id=e.message_id
+                   WHERE e.group_id=? AND e.summoned_at IS NULL
+                   ORDER BY e.event_id""",
+                (group_id,),
+            )
+            pending = await cursor.fetchall()
+            now = datetime.now(timezone.utc).isoformat()
+            await db.execute(
+                "UPDATE recall_events SET summoned_at=? WHERE group_id=? AND summoned_at IS NULL",
+                (now, group_id),
+            )
+            await db.execute(
+                """UPDATE recall_cursor
+                   SET last_event_id=MAX(last_event_id, COALESCE(
+                           (SELECT MAX(event_id) FROM recall_events WHERE group_id=?), 0)),
+                       last_summoned_at=?
+                   WHERE group_id=?""",
+                (group_id, now, group_id),
+            )
+            await db.commit()
+
+        # Remove only image files attached to discarded, not-yet-summoned recalls.
+        for row in pending:
+            if row["message_json"]:
+                for path in cached_image_paths_from_json(row["message_json"]):
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        logger.warning("Could not remove discarded image cache {}", path)
+        return len(pending)
+
+
+def recall_window_cutoff() -> str:
+    """ISO timestamp marking the start of the default recall window."""
+    return (datetime.now(timezone.utc) - timedelta(minutes=RECALL_WINDOW_MINUTES)).isoformat()
+
+
+async def pending_recall_counts(db: aiosqlite.Connection, group_id: str) -> tuple[int, int]:
+    """(未召回且落在默认时间窗内, 未召回总数) for one group."""
+    cursor = await db.execute(
+        """SELECT SUM(CASE WHEN recalled_at>=? THEN 1 ELSE 0 END) AS recent,
+                  COUNT(*) AS total
+           FROM recall_events WHERE group_id=? AND summoned_at IS NULL""",
+        (recall_window_cutoff(), group_id),
+    )
+    row = await cursor.fetchone()
+    return int(row["recent"] or 0), int(row["total"] or 0)
+
+
+def empty_recall_text(recent: int, total: int, all_pending: bool) -> str:
+    """Structured answer when there is nothing to draw."""
+    if total == 0:
+        if all_pending:
+            return "可莉把小本本翻到底啦，已经没有没看过的撤回记录咯。"
+        return (
+            f"可莉只翻了最近 {RECALL_WINDOW_MINUTES} 分钟，这段时间里没有被撤回的消息，"
+            "更早的也都看过了。"
+        )
+    if all_pending:
+        return f"唔…可莉这边显示还有 {total} 条没看过的记录，但一条都没取出来，待会儿再试试吧。"
+    return "\n".join(
+        [
+            f"可莉只翻了最近 {RECALL_WINDOW_MINUTES} 分钟，这段时间里没有被撤回的消息。",
+            f"不过还有 {total} 条更早的、没看过的记录躺在小本本里。",
+            "超级管理员可以让可莉把它们都翻出来：",
+            "· @可莉 撤回记录 全部 —— 所有还没看过的撤回消息",
+        ]
+    )
+
+
+def clear_recall_text(cleared: int) -> str:
+    if cleared == 0:
+        return "可莉的小本本上没有没看过的撤回记录，不用清啦。"
+    return "\n".join(
+        [
+            f"可莉擦掉了 {cleared} 条还没看过的撤回记录，对应的图片缓存也一起收拾干净了。",
+            "从现在开始重新累计哦。",
+        ]
+    )
+
+
+async def send_recall_history(
+    bot: Bot,
+    request: RecallRequest,
+    count: int | None,
+    *,
+    all_pending: bool = False,
+) -> int:
+    """Send not-yet-summoned recalls as images; return how many were drawn.
+
+    By default only recalls that happened inside ``RECALL_WINDOW_MINUTES`` are
+    shown; ``all_pending`` (super admin only, gated in ``handlers``) lifts that
+    limit.  Either way only the rows actually drawn are marked as summoned, so
+    older records stay pending for a later "全部" call.
+
+    The return value is what the caller needs to decide whether a short "already
+    sent it to your private chat" notice is warranted; 0 means nothing was
+    delivered (no rows, or the send failed and was reported).
+    """
+    group_id = str(request.group_id)
+    lock = _recall_locks.setdefault(group_id, asyncio.Lock())
+    async with lock:
+        async with connect() as db:
+            query = """SELECT e.event_id, e.recalled_at, m.message_id, m.user_id,
+                              m.sender_name, m.plain_text, m.sent_at, m.message_json
+                       FROM recall_events e JOIN messages m
+                         ON m.group_id=e.group_id AND m.message_id=e.message_id
+                       WHERE e.group_id=? AND e.summoned_at IS NULL"""
+            params: list[Any] = [group_id]
+            if not all_pending:
+                query += " AND e.recalled_at>=?"
+                params.append(recall_window_cutoff())
+            if count is None:
+                query += " ORDER BY e.event_id ASC"
+            else:
+                # "只看最近 N 条" picks the newest N, then they are drawn oldest-first.
+                query += " ORDER BY e.event_id DESC LIMIT ?"
+                params.append(count)
+            cursor = await db.execute(query, tuple(params))
+            rows = [dict(row) for row in await cursor.fetchall()]
+            recent, total = await pending_recall_counts(db, group_id)
+        if count is not None:
+            rows.reverse()
+        if not rows:
+            await send_notice(bot, request, empty_recall_text(recent, total, all_pending))
+            return 0
+
+        group_name = await group_name_for(bot, request.group_id, request.group_name)
+
+        # Wait for the initial full-group cache; then fill any missing senders.
+        avatar_task = _avatar_warm_tasks.get(request.group_id)
+        if avatar_task and not avatar_task.done():
+            await avatar_task
+        avatar_dir(request.group_id).mkdir(parents=True, exist_ok=True)
+        MEDIA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            await asyncio.gather(
+                *(cache_avatar(request.group_id, str(row["user_id"]), client) for row in rows)
+            )
+            for row in rows:
+                try:
+                    message_data = json.loads(row["message_json"])
+                    if any(
+                        segment.get("type") == "image"
+                        and not segment.get("data", {}).get("cached_path")
+                        for segment in message_data
+                    ):
+                        await cache_message_images(
+                            bot,
+                            request.group_id,
+                            str(row["message_id"]),
+                            message_data,
+                            client,
+                        )
+                        row["message_json"] = json.dumps(message_data, ensure_ascii=False)
+                        async with connect() as db:
+                            await db.execute(
+                                "UPDATE messages SET message_json=? WHERE group_id=? AND message_id=?",
+                                (row["message_json"], group_id, str(row["message_id"])),
+                            )
+                            await db.commit()
+                except (json.JSONDecodeError, TypeError, KeyError):
+                    logger.debug("Could not recover cached image data for recalled message")
+
+        max_images = max((len(cached_image_paths(row)) for row in rows), default=0)
+        chunks = paginate(rows, page_size_for(max_images))
+        files: list[Path] = []
+        try:
+            # 分页后可能有好几张，逐页在线程里渲染：一次请求能画出数秒的 CPU 活，
+            # 放在事件循环里会连带挡住心跳与其它群的消息处理。
+            files = [
+                await asyncio.to_thread(
+                    render_recall_page,
+                    chunk,
+                    request.group_id,
+                    group_name or "本群",
+                    page + 1,
+                    len(chunks),
+                )
+                for page, chunk in enumerate(chunks)
+            ]
+            for path in files:
+                result = await send_cards(
+                    bot, request, MessageSegment.image(path.resolve().as_uri())
+                )
+                if isinstance(result, dict) and result.get("status") == "failed":
+                    raise RuntimeError("OneBot failed to send recall image")
+        except Exception:
+            logger.exception("Could not send recall image batch")
+            await send_notice(
+                bot,
+                request,
+                "撤回记录图片发送失败；记录没有标记为已召回，可以稍后重试。",
+            )
+            return 0
+        finally:
+            for path in files:
+                path.unlink(missing_ok=True)
+
+        # Only what was actually drawn counts as summoned; anything older than the
+        # window (or beyond the requested count) stays pending on purpose.
+        summoned_at = datetime.now(timezone.utc).isoformat()
+        event_ids = [int(row["event_id"]) for row in rows]
+        placeholders = ",".join("?" * len(event_ids))
+        async with connect() as db:
+            await db.execute(
+                f"""UPDATE recall_events SET summoned_at=?
+                    WHERE group_id=? AND event_id IN ({placeholders})""",
+                (summoned_at, group_id, *event_ids),
+            )
+            await db.execute(
+                """UPDATE recall_cursor
+                   SET last_event_id=MAX(last_event_id, ?), last_summoned_at=?
+                   WHERE group_id=?""",
+                (max(event_ids), summoned_at, group_id),
+            )
+            await db.commit()
+        return len(event_ids)
+
+
+async def safe_send_recall_history(
+    bot: Bot,
+    request: RecallRequest,
+    count: int | None,
+    *,
+    all_pending: bool = False,
+) -> int:
+    sent = await guard(
+        "Recall history handler",
+        lambda: send_recall_history(bot, request, count, all_pending=all_pending),
+        on_error=lambda: send_notice(
+            bot,
+            request,
+            "可莉的撤回记录处理失败了，请稍后再试；详细错误已记入机器人日志。",
+        ),
+    )
+    return 0 if sent is None else sent
