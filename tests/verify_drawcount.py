@@ -339,9 +339,10 @@ async def check_send_bottle_records_label() -> None:
 
 def check_interface_is_reserved() -> None:
     print("\n== 9. 榜单接口已挂成命令（接线正确）==")
-    handlers_src = (Path(ROOT) / "plugins/group_bot/handlers.py").read_text(encoding="utf-8")
+    project = Path(ROOT)
+    handlers_src = (project / "plugins" / "group_bot" / "handlers.py").read_text(encoding="utf-8")
     essence_src = "\n".join(
-        (Path(ROOT) / "plugins/group_bot" / name).read_text(encoding="utf-8")
+        (project / "plugins" / "group_bot" / name).read_text(encoding="utf-8")
         for name in (
             "bottle/pool.py",
             "bottle/stats.py",
@@ -352,7 +353,7 @@ def check_interface_is_reserved() -> None:
     )
 
     check_true("handlers.py 里有「被抽到榜」命令词", "被抽到榜" in handlers_src)
-    flow_src = (Path(ROOT) / "plugins/group_bot/bottle/flow.py").read_text(encoding="utf-8")
+    flow_src = (project / "plugins" / "group_bot" / "bottle" / "flow.py").read_text(encoding="utf-8")
     check_true(
         "bottle_flow.py 里定义了 send_drawn_content_leaderboard",
         bool(re.search(r"^async def send_drawn_content_leaderboard\(", flow_src, re.M)),

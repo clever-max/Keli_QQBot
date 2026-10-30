@@ -3,7 +3,8 @@
 本文描述 `<repo>` 在本机（Windows 10 专业版）上的**启动、停止、观测与排障**。
 开发规范与提交流程见 [development.md](development.md)，文档索引见 [README.md](README.md)。
 
-本机事实：只装了 Windows PowerShell 5.1（命令是 `powershell`），**没有 `pwsh`**；
+本机事实：同时装有 Windows PowerShell 5.1（命令是 `powershell`）和 PowerShell 7
+（命令是 `pwsh`，当前 7.6.8），脚本两者都能跑；
 Python 环境是仓库内的 `.venv`（注意 `.venv` 不能跨机器/跨目录复制，`pyvenv.cfg` 会指向原路径）。
 
 ---

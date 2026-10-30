@@ -39,10 +39,11 @@
 【2026-10-18】media_cache 只是派生缓存（可由 media_archive 重建）
 | `album` | 群相册拉取、防御式字段解析、缓存；产出照片或视频 | `AlbumPhoto`（含 `kind`）、`AlbumUnavailable`、`parse_media_item()`、`fetch_album_photos()`、`materialize_photo()`、`mark_broken()` |
 | `render` | 纯文本渲染，不碰网络与数据库；表情段写成 `[表情:id:名字]` 标记 | `render_message()`、`clean_model_text()`、`cap_text()` |
+| `replies` | 回复目标的本地批量解析与合并转发摘要；缺失目标显式标记 | `load_reply_previews()`、`load_forward_previews()`、`ReplyPreview` |
 | `faces` | QQ 内置表情的图源解析与缓存：本机 QQ 客户端 → 腾讯 CDN → 文字兜底；结果落 `data/face_cache/` | `face_token()`、`face_name()`、`image_path()`、`image()`、`scaled_image()` |
 | `textimg` | 字体加载与文本换行 | `font()`、`wrap_text()` |
 | `richtext` | 卡片正文混排：文字 + 内联表情图，表情标记作为整体参与折行与测宽 | `Run`、`parse()`、`wrap()`、`measure()`、`draw()` |
-| `card` | 卡片几何与绘制；调用方只描述画什么（正文支持内联 QQ 表情图） | `CardEntry`、`render_card_page()`、`paginate()`、`page_size_for()`、`fitted_size()`、`bubble_size()` |
+| `card` | 卡片几何与绘制；调用方只描述画什么（正文支持内联 QQ 表情图，回复/转发支持引用预览） | `CardEntry`、`CardQuote`、`render_card_page()`、`paginate()`、`page_size_for()`、`fitted_size()`、`bubble_size()` |
 | `essence` | **再导出层**：只把下面四个 `bottle_*` 模块的符号重新导出，保证 `handlers.py` 与测试的导入路径不变 | 见下四行；**不要在测试里对 `essence.X` 打桩**（打不中，见 `development.md`） |
 | `bottle_pool` | 漂流瓶的池子与选取：拉取/缓存、键空间、抽样与防重复、内容提取、抽取记录 | `ChosenBottle`、`fetch_essence_list()`、`choose_bottle()`、`choose_essence()`、`choose_album_photo()`、`preferred_order()`、`draw_history()`、`drawn_message_ids()`、`record_draw()`、`essence_text()`、`essence_video_ref()`、`pool_sizes()` |
 | `bottle_stats` | 被抽到次数与被抽到榜的数据层（只读 `essence_draws`） | `DrawnContent`、`draw_times()`、`draw_times_after()`、`drawn_content_leaderboard()`、`drawn_content_leaderboard_text()`、`content_label()`、`drawn_rank_label()` |
@@ -113,13 +114,13 @@
 
 **① 群消息 → 归档 / 命令路由**（`handle_group_message`）：白名单群过滤 → `save_message()`（含图片缓存）→ `!recalled` 纯文本快捷路径 → @ 检测（无 @ 则结束）→ `status`（仅 `STATUS_USERS`）→ 漂流瓶（含 `相册` 形式）→ `is_recognized_command()` 过滤未知指令（静默）→ `撤回记录` → 非管理员 120s 冷却闸门 → 昨日总结 / `help` / 丢漂流瓶榜 / 私聊投递开关 / `clear`。
 
-**② 撤回通知 → 标记**（`handle_group_recall` → `mark_recalled()`）：先 `UPDATE messages SET recalled_at, recalled_by WHERE message_id=? AND group_id=?`；只有 `rowcount` 非零（即这条消息确实在归档里）才 `INSERT OR IGNORE INTO recall_events`。这样撤回事件天然与本地归档对齐，不依赖 QQ 侧的撤回后历史查询。
+**② 撤回通知 → 标记**（`handle_group_recall` → `mark_recalled()`）：先写入 `recall_events`，再更新 `messages.recalled_at/recalled_by`；消息事件与撤回通知乱序时，后续 `save_message()` 会把撤回时间回填到消息行。这样撤回事件不会因为消息尚未落库而丢失，也不依赖 QQ 侧的撤回后历史查询。
 
 **③ 漂流瓶抽取 → 选池 → 物化 → 卡片或视频转发**（`send_bottle`）：`claim_essence_draw()` 判定冷却/配额 → `choose_bottle()` 决定类别与对象 → 物化 → 投递 → `record_draw()` → `bottle_hint_text()` 补一条文字。
 
 - 选池顺序：`漂流瓶 相册` 显式指定 → 相册被配置关闭则只抽精华 → `preferred_kind_order()` 连续同类补偿 → 按 `BOTTLE_ALBUM_SHARE` 随机；首选那类没内容时回退另一类（显式相册形式不回退）
-- 物化：精华走 `materialize_images()`（图片段全部可下载才采用），相册走 `materialize_photo()`；失败的对象记进坏图集合并换下一个候选
-- 投递：`ChosenBottle.video_ref` 非空时**直接转发视频**（`MessageSegment("video", ...)`，不下载、不渲染卡片）；否则 `render_bottle_card()` 出图并用 `MessageSegment.image()` 发送，发送后删除临时文件
+- 物化：精华走 `materialize_images()`（图片段全部可下载才采用），相册走 `materialize_photo()`；带 `file` 段的精华不物化图片，直接走文件投递；失败的对象记进坏图集合并换下一个候选
+- 投递：`ChosenBottle.video_ref` 非空时**直接转发视频**（`MessageSegment("video", ...)`）；`file_parts` 非空时**直接发原文件**（优先 `archived_media_paths(kind="file")` 的归档副本，缺失才按 `url` 下载，再用 `upload_group_file` 上传）；这两条路径都不渲染卡片，只补 `bottle_hint_text()`。其余情况 `render_bottle_card()` 出图并用 `MessageSegment.image()` 发送，发送后删除临时文件
 
 ## 6. 图片与视频链路
 
@@ -129,7 +130,8 @@
 | 原图保留与落盘 | `normalize_cached_image()`：最长边 ≤ `IMAGE_CACHE_MAX_DIMENSION` 且字节数 ≤ `MAX_CACHED_IMAGE_BYTES` 时**原样落盘**，只有超限才 `thumbnail()` 缩放并按 `IMAGE_CACHE_JPEG_QUALITY` 重编码（RGBA/LA 先合成白底）。路径为 `media_cache/<sha256(group_id:message_id)[:32]>_<index>.jpg`，回写进段的 `data.cached_path`；读取走 `cached_image_paths_from_json()`，带 `relative_to(MEDIA_CACHE_DIR)` 越界防护 |
 | 头像 | `cache_avatar()` 取 `q1.qlogo.cn` s=100 后存 128×128 PNG，按 `AVATAR_CACHE_MAX_AGE` 判过期；`warm_group_avatars()` 在连接时用 `get_group_member_list` 预热并填充 `_member_names` |
 | 卡片 | 图片框取 `max(64, min(RECALL_THUMB_SIZE, body_width))`；`fitted_size()` 的 `scale = min(max_w/宽, max_h/高, 1.0)`——**绝不放大**，小图按原尺寸显示 |
-| 视频 | 不下载、不做卡片。精华用 `essence_video_ref()` 从 `video` 段取可播放引用；相册由 `parse_media_item()` 先判视频再判图片（`kind="video"`），转发失败会退还次数 |
+| 视频 | 群消息收到后永久归档到 `media_archive/`；撤回记录先发卡片，再发送归档的原视频，视频发送成功后才标记该页已召回。精华用 `essence_video_ref()` 从 `video` 段取可播放引用；相册由 `parse_media_item()` 先判视频再判图片（`kind="video"`），转发失败会退还次数 |
+| 文件 | 文件段（包括 `.mp4` 这类视频文件）统一走 `media/files.send_original_file()`：群里 `upload_group_file`、私聊 `upload_private_file`。漂流瓶由 `essence_file_parts()` 识别，优先复用 `message_media` 归档副本，缺失才按 `url` 下载临时文件，不发卡片、成功后才记 `essence_draws`；撤回记录由 `send_recall_files()` 在卡片之后补发归档原件，失败则不标记该页已召回 |
 
 ## 7. 读代码时需要留意的既有约束
 

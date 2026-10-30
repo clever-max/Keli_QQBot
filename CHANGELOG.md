@@ -33,6 +33,36 @@
 
 <!-- ITERATION-INSERT-POINT 新迭代追加在这行下面，最新的在最上面 -->
 
+
+
+
+## [迭代 34] - 2026-10-24 — `373717d`
+
+可运行验证：`python -m compileall plugins` 通过；`nonebot.init()` + `load_plugins("plugins")` 成功加载 ['group_bot']。
+
+### 新增
+
+- feat(bottle): 文件类精华/撤回原样返回并修复私聊撤回入口
+- 全量 23/23 通过；recall_private_delivery 已置 1（运行时数据，不在提交内）
+
+## [迭代 33] - 2026-10-23 — `b629c4a`
+
+可运行验证：`python -m compileall plugins` 通过；`nonebot.init()` + `load_plugins("plugins")` 成功加载 ['group_bot']。
+
+### 新增
+
+- feat: 撤回记录返回原视频
+- 从永久媒体归档发送撤回视频，并在视频发送成功后标记召回
+
+## [迭代 32] - 2026-10-23 — `f2a424a`
+
+可运行验证：`python -m compileall plugins` 通过；`nonebot.init()` + `load_plugins("plugins")` 成功加载 ['group_bot']。
+
+### 新增
+
+- feat: 完善撤回与漂流瓶消息展示
+- 增加回复与合并转发预览、媒体摘要和分页幂等标记
+
 ## [迭代 31] - 2026-10-21 — `4603399`
 
 可运行验证：`python -m compileall plugins` 通过；`nonebot.init()` + `load_plugins("plugins")` 成功加载 ['group_bot']。
@@ -229,7 +259,8 @@
 ### 修复
 
 - `summary.py` 补回 `REPEAT_MIN_COUNT` 导入。拆包时漏掉这个常量，导致 2026-10-12 该群
-  「昨日消息总结」无任何回复、且当天配额被静默消耗；经过见内部故障记录。
+  「昨日消息总结」无任何回复、且当天配额被静默消耗；经过见
+  内部故障记录。
 
 ## [迭代 10] - 2026-10-14 — `2fc5177`
 

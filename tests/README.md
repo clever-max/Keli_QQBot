@@ -13,13 +13,14 @@
 | 套件 | 覆盖 |
 |---|---|
 | `verify_recall.py` | 撤回记录的分页、时间窗、去重、游标推进 |
+| `verify_recall_enhancements.py` | 回复/合并转发预览、媒体标签、撤回竞态、视频/文件原文件召回、聊天记录不返回、分页失败幂等标记 |
 | `verify_delivery.py` | 群聊/私聊投递选择与兜底文案 |
 | `verify_switch.py` | `bot_settings` 运行时开关的持久化与回读 |
 | `verify_gate.py` | 权限闸门与冷却（非管理员 @ 冷却、主人豁免） |
 | `verify_permissions.py` | 群/用户白名单、`*` 通配、临时会话 |
 | `verify_nogroupid.py` | 未配置群号时的静默行为 |
 | `verify_bottle.py` | 漂流瓶：池子混合比例、相册开关、内容提取 |
-| `verify_media.py` | 图片/视频缓存、路径校验、发送兜底 |
+| `verify_media.py` | 图片/视频缓存、路径校验、发送兜底；精华视频直接转发、文件类精华发原文件 + 文字提示 |
 | `verify_font.py` | 字体覆盖（机器人文案 0 缺字；线上数据只报覆盖率） |
 | `verify_face.py` | QQ 表情渲染：id→名字、`[表情:id:名字]` 标记、混排不拆标记、本地图源/缓存、缺图退回文字 |
 | `verify_group_scope.py` | 分群隔离：新增群只拿自己的授权、别的群的 `*` 不串群；喝水/status 的分群排除 |

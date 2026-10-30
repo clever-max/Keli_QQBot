@@ -391,6 +391,38 @@ def archived_media(group_id: str, message_id: str) -> list[dict[str, Any]]:
         db.close()
 
 
+async def archived_media_paths(
+    group_id: int | str,
+    message_ids: list[str],
+    *,
+    kind: str = "video",
+) -> dict[str, list[Path]]:
+    """Return existing permanent media files for a batch of messages.
+
+    Only successful archive rows are returned.  The caller can then decide
+    whether to trigger a one-shot retry for rows that still have no file.
+    """
+    if not message_ids:
+        return {}
+    placeholders = ",".join("?" for _ in message_ids)
+    result: dict[str, list[Path]] = {}
+    async with connect() as db:
+        cursor = await db.execute(
+            f"""SELECT message_id, sha256, suffix
+                  FROM message_media
+                 WHERE group_id=? AND kind=? AND error='' AND sha256<>''
+                   AND message_id IN ({placeholders})
+                 ORDER BY message_id, part_index""",
+            (str(group_id), kind, *message_ids),
+        )
+        rows = await cursor.fetchall()
+    for row in rows:
+        path = stored_path(str(row["sha256"]), str(row["suffix"] or ".bin"))
+        if path.is_file():
+            result.setdefault(str(row["message_id"]), []).append(path)
+    return result
+
+
 # 每轮补归档处理多少条消息；小批量、可中断，避免一次扫太久占住带宽。
 _SWEEP_BATCH = 100
 # 没有积压时的巡检间隔。有积压时不停，一轮接一轮地冲（见 start_archive_sweeper）。

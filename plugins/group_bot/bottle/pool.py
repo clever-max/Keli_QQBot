@@ -160,6 +160,9 @@ class ChosenBottle(NamedTuple):
 
     A non-empty ``video_ref`` means this pick is a **video**: it is forwarded as-is
     with a ``video`` message segment and no card is rendered for it.
+
+    A non-empty ``file_parts`` means the essence is a **file message** (including a
+    video sent as a file): the files are uploaded/sent as-is instead of a card.
     """
 
     kind: str  # "essence" | "album"
@@ -169,6 +172,7 @@ class ChosenBottle(NamedTuple):
     reason: str  # "ok" | "exhausted" | "unavailable"
     pool_total: int = 0  # size of the pool this pick (or failure) came from
     video_ref: str = ""  # playable video reference when this pick is a video
+    file_parts: tuple[dict[str, Any], ...] = ()  # file segment data when this pick is a file
 
 
 def _essence_key(item: dict[str, Any]) -> str:
@@ -208,7 +212,15 @@ def essence_text(item: dict[str, Any], group_id: int) -> str:
     raw = item.get("content")
     if not isinstance(raw, list):
         return ""
-    return resolve_mentions(render_message(raw, omit_images=True), group_id)
+    return resolve_mentions(
+        render_message(
+            raw,
+            omit_images=True,
+            omit_replies=item.get("_reply_preview") is not None,
+            omit_forwards=item.get("_forward_preview") is not None,
+        ),
+        group_id,
+    )
 
 
 def essence_image_segments(item: dict[str, Any]) -> list[dict[str, Any]]:
@@ -216,6 +228,24 @@ def essence_image_segments(item: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(raw, list):
         return []
     return [segment for segment in raw if isinstance(segment, dict) and segment.get("type") == "image"]
+
+
+def essence_file_parts(item: dict[str, Any]) -> list[dict[str, Any]]:
+    """精华消息里所有 ``file`` 段的数据（视频以文件形式发送时也在这里）。
+
+    返回的是 ``segment["data"]`` 的副本，调用方只读；文件名/大小/下载地址都在里面。
+    """
+    raw = item.get("content")
+    if not isinstance(raw, list):
+        return []
+    parts: list[dict[str, Any]] = []
+    for segment in raw:
+        if not isinstance(segment, dict) or segment.get("type") != "file":
+            continue
+        data = segment.get("data")
+        if isinstance(data, dict):
+            parts.append(dict(data))
+    return parts
 
 
 def _is_playable_ref(value: str) -> bool:
@@ -429,8 +459,20 @@ async def choose_essence(
             return None
         return ChosenBottle("essence", item, [], len(drawn), "ok", len(items), ref)
 
+    def file_pick(item: dict[str, Any]) -> ChosenBottle | None:
+        """文件类精华（含以文件形式发的视频）直接发原文件，不做卡片。"""
+        parts = essence_file_parts(item)
+        if not parts:
+            return None
+        return ChosenBottle(
+            "essence", item, [], len(drawn), "ok", len(items), "", tuple(parts)
+        )
+
     for item in candidates[:attempts]:
         picked = video_pick(item)
+        if picked is not None:
+            return picked
+        picked = file_pick(item)
         if picked is not None:
             return picked
         if not essence_image_segments(item):
@@ -441,9 +483,12 @@ async def choose_essence(
         broken.add(key(item))
         logger.info("Skipping essence {} : pictures unavailable", key(item))
 
-    # Nothing with pictures worked; fall back to a text-only or video essence.
+    # Nothing with pictures worked; fall back to a text-only, file or video essence.
     for item in candidates:
         picked = video_pick(item)
+        if picked is not None:
+            return picked
+        picked = file_pick(item)
         if picked is not None:
             return picked
         if not essence_image_segments(item):

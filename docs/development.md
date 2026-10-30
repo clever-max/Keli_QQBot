@@ -91,8 +91,9 @@ origin  https://github.com/clever-max/qqbot.git   （分支 main）
 powershell -ExecutionPolicy Bypass -File .\scripts\dev\commit-iteration.ps1 -Message "feat: 增加 xxx"
 ```
 
-本机只装了 Windows PowerShell 5.1（命令是 `powershell`），**没有 `pwsh`**；装了 PowerShell 7
-就把 `powershell` 换成 `pwsh`。本机默认禁止运行脚本，所以要 `-ExecutionPolicy Bypass`
+本机同时装有 Windows PowerShell 5.1（命令是 `powershell`）和 PowerShell 7（命令是 `pwsh`，
+当前 7.6.8）；两者都能跑这些脚本，示例默认写 `powershell` 以兼容没装 7 的机器，
+把它换成 `pwsh` 即可。本机默认禁止运行脚本，所以要 `-ExecutionPolicy Bypass`
 （或先 `Set-ExecutionPolicy -Scope Process Bypass`）。
 
 ### 2.1 参数
@@ -112,7 +113,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\dev\commit-iteration.ps1 -Mes
 
 ### 2.2 为什么多行提交信息必须用 `-MessageFile`
 
-用 `powershell -File` 调用脚本时，参数会被重新拼成一条命令行：直接内联带引号的多行字符串
+用 `powershell -File`（或 `pwsh -File`）调用脚本时，参数会被重新拼成一条命令行：直接内联带引号的多行字符串
 会被拆坏——实测会把消息后半段当成位置参数，报出「补登记已有提交 pwsh」这类莫名其妙的错。
 把信息写进 UTF-8 文件再交给 `-MessageFile` 最稳，文件本身不受 git 跟踪也不影响提交内容：
 
@@ -141,8 +142,9 @@ CHANGELOG 记录里要写下**这次迭代的提交哈希**，而哈希只有提
 
 ### 2.4 编码纪律
 
-- `scripts/*.ps1` **必须保持 UTF-8 带 BOM**：本机是 Windows PowerShell 5.1、ANSI 代码页 936，
-  没有 BOM 的 UTF-8 脚本会被按 GBK 解读，中文全变乱码、个别字节还会直接造成语法错误。
+- `scripts/*.ps1` **必须保持 UTF-8 带 BOM**：仓库仍要在 Windows PowerShell 5.1（ANSI 代码页 936）
+  下可运行，没有 BOM 的 UTF-8 脚本会被按 GBK 解读，中文全变乱码、个别字节还会直接造成语法错误。
+  PowerShell 7 能读无 BOM 的脚本，但为了 5.1 兼容仍要求带 BOM。
 - `CHANGELOG.md` 等 Markdown **不要 BOM**。
 - 用 PowerShell 改写含中文的 UTF-8 文件时，用 `[System.IO.File]::ReadAllText/WriteAllText`
   配 `UTF8Encoding($false)`；**不要**用 `Get-Content | Set-Content` 往返（会按 ANSI 读写而损坏中文）。
@@ -180,7 +182,7 @@ CHANGELOG 记录里要写下**这次迭代的提交哈希**，而哈希只有提
 | `verify_permissions.py` | 撤回记录开放给全群、全群 120 秒冷却与主人豁免、`clear` 仅主人、help 不再有超管段、跨群点名需被点名 |
 | `verify_nogroupid.py` | 回复文本不含任何群号、`status` 报告改汇总且只发私聊 |
 | `verify_bottle.py` | 相册返回结构的容错解析、双池抽取与降级回退、丢漂流瓶榜合并计数、连续同类补偿、`漂流瓶 相册` 的四种失败与退次数 |
-| `verify_media.py` | 图片不放大且保留原图画质、卡片图框宽度、相册优先取原图键、视频识别与直接转发、转发失败退次数 |
+| `verify_media.py` | 图片不放大且保留原图画质、卡片图框宽度、相册优先取原图键、视频识别与直接转发、视频转发失败退次数、文件类精华（含 `.mp4`）走原文件 + 归档副本/URL 下载、上传失败退次数 |
 | `verify_font.py` | 缺字回退链的构成、变体选择符（`U+FE0F`）必须被跳过（`❤️` 曾变成两个空框）、空格保留宽度且不误报、典型缺字字符各由谁承担、**归档全部 2593 个字符无法绘制数为 0**、多段文本的锚点对齐 |
 | `verify_face.py` | QQ 内置表情：`face.id/faceText` → `[表情:id:名字]` 标记、卡片正文「文字 + 表情图」混排且折行不拆标记、本机 `sysface_res` 图源与 64px 缓存、404 只探测一次、缺图退回 `[名字]` 文字 |
 | `verify_group_scope.py` | 分群隔离：新增群的授权只按自己的名单判定（开放群的 `*` 不串群）、陌生人在新群仍被拒、`WATER_EXCLUDED_GROUP_IDS` 只排除指定群、`STATUS_EXCLUDED_GROUP_IDS` 从所有聚合查询里剔除该群且命令静默 |

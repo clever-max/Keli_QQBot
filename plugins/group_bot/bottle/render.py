@@ -26,7 +26,7 @@ from ..media.album import (
     materialize_photo,
     mark_broken,
 )
-from ..common.card import CardEntry, render_card_page
+from ..common.card import CardEntry, CardQuote, render_card_page
 from ..core.config import (
     BOTTLE_ALBUM_ENABLED,
     BOTTLE_ALBUM_SHARE,
@@ -46,6 +46,7 @@ from ..media.pipeline import (
     cached_image_paths_from_json,
 )
 from ..common.render import render_message
+from ..common.replies import ReplyPreview, load_forward_previews, load_reply_preview
 from ..core.state import (
     _album_broken,
     _avatar_warm_tasks,
@@ -90,6 +91,25 @@ class DrawnContentCard(NamedTuple):
     image: Path | None
     extra_images: int = 0
     missing: bool = False
+    quote: CardQuote | None = None
+
+
+def _card_quote(preview: ReplyPreview | None) -> CardQuote | None:
+    if preview is None:
+        return None
+    meta = ""
+    if preview.sent_at:
+        try:
+            meta = datetime.fromisoformat(preview.sent_at).astimezone(GROUP_TIMEZONE).strftime("%m-%d %H:%M")
+        except (TypeError, ValueError):
+            pass
+    return CardQuote(
+        title=preview.title,
+        name=preview.sender_name,
+        meta_text=meta or ("未归档" if preview.missing else ""),
+        text=preview.text,
+        image_paths=list(preview.image_paths),
+    )
 
 
 def render_bottle_card(
@@ -137,6 +157,7 @@ def render_bottle_card(
         image_paths=list(chosen.image_paths)[:4],
         image_note="",
         extra_images=max(0, len(chosen.image_paths) - 4),
+        quote=_card_quote(item.get("_reply_preview") or item.get("_forward_preview")),
     )
     return render_card_page("漂流瓶", subtitle, [entry], group_id=group_id)
 
@@ -172,6 +193,7 @@ def render_drawn_leaderboard_card(
                 text=card.text,
                 image_paths=[card.image] if card.image else [],
                 extra_images=card.extra_images,
+                quote=card.quote,
             )
         )
     return render_card_page(
@@ -250,6 +272,19 @@ async def resolve_drawn_content(
             sender = " ".join(str(item.get("sender_nick") or "群友").split())[:16] or "群友"
             operator = " ".join(str(item.get("operator_nick") or "").split())[:16]
             source = f"精华 · 由 {operator} 设为精华" if operator else "精华消息"
+            content = item.get("content")
+            if isinstance(content, list):
+                preview = await load_reply_preview(group_id, content)
+                if preview is not None:
+                    item["_reply_preview"] = preview
+                forward_previews = await load_forward_previews(bot, [content])
+                forward_ids_for_item = [
+                    str(segment.get("data", {}).get("id"))
+                    for segment in content
+                    if isinstance(segment, dict) and segment.get("type") == "forward"
+                ]
+                if forward_ids_for_item and forward_ids_for_item[0] in forward_previews:
+                    item["_forward_preview"] = forward_previews[forward_ids_for_item[0]]
             body = " ".join(essence_text(item, group_id).split())
             image = None
             extra = 0
@@ -268,6 +303,8 @@ async def resolve_drawn_content(
                     body[:LEADERBOARD_TEXT_CHARS] + ("…" if len(body) > LEADERBOARD_TEXT_CHARS else ""),
                     image,
                     extra,
+                    False,
+                    _card_quote(item.get("_reply_preview") or item.get("_forward_preview")),
                 )
             )
     return cards

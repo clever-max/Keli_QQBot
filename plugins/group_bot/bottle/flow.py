@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import random
 import re
+import tempfile
 import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -26,8 +28,12 @@ from ..media.album import (
     materialize_photo,
     mark_broken,
 )
+from ..media.archive import archived_media_paths
+from ..media.files import file_name, file_size_text, send_original_file
 from ..common.card import CardEntry, render_card_page
+from ..common.replies import load_forward_previews, load_reply_preview
 from ..core.config import (
+    ARCHIVE_MAX_BYTES,
     BOTTLE_ALBUM_ENABLED,
     BOTTLE_ALBUM_SHARE,
     BOTTLE_HISTORY_DAYS,
@@ -60,6 +66,7 @@ from .pool import (
     ChosenBottle,
     ESSENCE_DRAW_RETENTION_DAYS,
     EssenceUnavailable,
+    _is_playable_ref,
     _pick_key,
     album_pool_enabled,
     album_pool_size,
@@ -263,6 +270,63 @@ def album_no_showable_text(album_total: int) -> str:
     )
 
 
+async def _download_file_part(part: dict[str, Any], index: int) -> Path:
+    """把文件段落成本地临时文件：优先用 ``file`` 本地路径，否则下载 ``url``。"""
+    local = str(part.get("file") or "").strip()
+    remote = str(part.get("url") or "").strip()
+    if local and _is_playable_ref(local):
+        path = Path(local[7:] if local.startswith("file://") else local)
+        if path.is_file():
+            return path
+    if not remote:
+        raise RuntimeError(f"file part {index} has no downloadable reference")
+
+    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+        response = await client.get(remote)
+        response.raise_for_status()
+    content = response.content
+    if ARCHIVE_MAX_BYTES and len(content) > ARCHIVE_MAX_BYTES:
+        raise RuntimeError(f"file part {index} exceeds ARCHIVE_MAX_BYTES")
+
+    suffix = Path(file_name(part, index)).suffix or ".bin"
+    handle, temp_name = tempfile.mkstemp(prefix="bottle-file-", suffix=suffix)
+    with os.fdopen(handle, "wb") as file_obj:
+        file_obj.write(content)
+    return Path(temp_name)
+
+
+async def upload_bottle_files(
+    bot: Bot, group_id: int, chosen: ChosenBottle
+) -> list[str]:
+    """把精华里的文件原样发到群里，返回文件名列表。
+
+    优先用 ``message_media`` 里已经归档的本地副本（不联网、不受 URL 过期影响），
+    缺失的再按 ``url`` 下载成临时文件。任一步失败都抛异常，由调用方退次数。
+    """
+    item = chosen.item if isinstance(chosen.item, dict) else {}
+    message_id = str(item.get("message_id") or "")
+    archived: list[Path] = []
+    if message_id:
+        archived_map = await archived_media_paths(group_id, [message_id], kind="file")
+        archived = archived_map.get(message_id, [])
+
+    temp_files: list[Path] = []
+    names: list[str] = []
+    try:
+        for index, part in enumerate(chosen.file_parts):
+            name = file_name(part, index)
+            source = archived[index] if index < len(archived) else None
+            if source is None:
+                source = await _download_file_part(part, index)
+                temp_files.append(source)
+            await send_original_file(bot, source, name, group_id=group_id)
+            names.append(name)
+    finally:
+        for path in temp_files:
+            path.unlink(missing_ok=True)
+    return names
+
+
 def bottle_hint_text(
     chosen: ChosenBottle,
     essence_total: int,
@@ -290,10 +354,23 @@ def bottle_hint_text(
         item = chosen.item
         sender = " ".join(str(item.get("sender_nick") or "群友").split())[:16] or "群友"
         operator = " ".join(str(item.get("operator_nick") or "群友").split())[:16] or "群友"
-        lines = [
-            "可莉捞上来一个漂流瓶，里面是一段视频！"
-            if chosen.video_ref
-            else "可莉捞上来一个漂流瓶，里面是一条精华消息！",
+        if chosen.video_ref:
+            subject = "一段视频"
+        elif chosen.file_parts:
+            subject = "一个文件"
+        else:
+            subject = "一条精华消息"
+        lines = [f"可莉捞上来一个漂流瓶，里面是{subject}！"]
+        if chosen.file_parts:
+            for index, part in enumerate(chosen.file_parts[:3]):
+                size_text = file_size_text(part)
+                lines.append(
+                    f"· 文件：{file_name(part, index)}"
+                    + (f"（{size_text}）" if size_text else "")
+                )
+            if len(chosen.file_parts) > 3:
+                lines.append(f"· 另有 {len(chosen.file_parts) - 3} 个文件")
+        lines += [
             f"· 出自 {sender}",
             f"· 由 {operator} 设为精华（{format_local(item.get('operator_time') or 0, '%m-%d %H:%M')}）",
             f"· 本群一共有 {essence_total} 条精华",
@@ -476,7 +553,47 @@ async def send_bottle(
         )
         return
 
+    # 文件类精华（含以文件形式发送的视频）：直接发原文件，不做卡片。
+    if chosen.file_parts:
+        try:
+            await upload_bottle_files(bot, group_id, chosen)
+        except Exception:
+            logger.exception("Could not send the bottle files")
+            await refund_essence_draw(group_id, event.user_id)
+            await bot.send_group_msg(
+                group_id=group_id,
+                message="这个文件可莉没能发出去，次数已经还给你啦，等会儿再试一次吧。",
+            )
+            return
+        await record_draw(group_id, pick_key, day, label=pick_label)
+        await bot.send_group_msg(
+            group_id=group_id,
+            message=bottle_hint_text(
+                chosen._replace(drawn_count=chosen.drawn_count + 1),
+                essence_total,
+                album_total,
+                verdict.remaining,
+                drawn_times=drawn_times,
+            ),
+        )
+        return
+
     # 精华卡片要作者的群头像；相册卡片要上传者的。
+    if chosen.kind == "essence" and isinstance(chosen.item, dict):
+        content = chosen.item.get("content")
+        if isinstance(content, list):
+            preview = await load_reply_preview(group_id, content)
+            if preview is not None:
+                chosen.item["_reply_preview"] = preview
+            forward_previews = await load_forward_previews(bot, [content])
+            forward_ids_for_item = [
+                str(segment.get("data", {}).get("id"))
+                for segment in content
+                if isinstance(segment, dict) and segment.get("type") == "forward"
+            ]
+            if forward_ids_for_item and forward_ids_for_item[0] in forward_previews:
+                chosen.item["_forward_preview"] = forward_previews[forward_ids_for_item[0]]
+
     card_user_id = (
         str(chosen.item.uploader_id)
         if chosen.kind == "album"

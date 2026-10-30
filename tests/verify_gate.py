@@ -322,6 +322,17 @@ async def main() -> None:
     check("M 群里只有一条回执", names.count("send_group_msg"), 1)
     check("M 回执在群里且带条数", "悄悄发到你的私聊" in bot.texts()[0], True)
 
+    print("\n== N. 普通私聊里显式群号可查任一授权群 ==")
+    await reset_pending(OTHER)
+    await add_recall(OTHER, "4002", "另一个群的一条")
+    bot = StubBot()
+    await handle_private_message(
+        bot, private_event(f"撤回记录 {OTHER}", OWNER, group_id=None)
+    )
+    check("N 只走私聊", {n for n, _ in bot.calls if n.startswith("send_")}, {"send_private_msg"})
+    check("N 带的是目标群", bot.calls[0][1].get("group_id"), OTHER)
+    check("N 目标群的记录被标记", await pending(OTHER), 0)
+
     print("\n" + "=" * 60)
     if failures:
         print(f"{len(failures)} 项失败：")

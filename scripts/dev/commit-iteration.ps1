@@ -21,8 +21,8 @@
 
     用法
     ----
-      这台机器只装了 Windows PowerShell 5.1（命令是 powershell），没有 pwsh；如果你装了
-      PowerShell 7，把下面的 powershell 换成 pwsh 即可，两者都能跑。
+      这台机器同时装有 Windows PowerShell 5.1（命令是 powershell）和 PowerShell 7
+      （命令是 pwsh，7.6.8）；两者都能跑，下面的示例用 powershell，换成 pwsh 即可。
 
       # 常规：验证当前工作区 → 提交 → 登记 → （可选）推送
       powershell -ExecutionPolicy Bypass -File .\scripts\dev\commit-iteration.ps1 -Message "feat: 增加 xxx"
@@ -52,9 +52,10 @@
     注意：本机默认禁止运行脚本，所以要用 powershell -ExecutionPolicy Bypass -File（或先
     Set-ExecutionPolicy -Scope Process Bypass）。
 
-    编码：本文件必须保持「UTF-8 带 BOM」。本机是 Windows PowerShell 5.1，ANSI 代码页 936，
-    没有 BOM 的 UTF-8 脚本会被按 GBK 解读——中文全变乱码，个别字节还会直接造成语法错误。
-    带 BOM 的 UTF-8 在 PS 5.1 与 PS 7 下都能正确读取；用记事本或 VS Code 另存时请保持 BOM。
+    编码：本文件必须保持「UTF-8 带 BOM」。本机的 powershell 是 Windows PowerShell 5.1、
+    ANSI 代码页 936；没有 BOM 的 UTF-8 脚本会被按 GBK 解读——中文全变乱码，个别字节还会
+    直接造成语法错误。带 BOM 的 UTF-8 在 PS 5.1 与 PS 7 下都能正确读取；用记事本或
+    VS Code 另存时请保持 BOM。
 #>
 
 [CmdletBinding()]

@@ -44,9 +44,9 @@ LABELS = {
     "video": "[视频]",
     "json": "[卡片]",
     "xml": "[卡片]",
-    "reply": "[回复]",
-    "forward": "[聊天记录]",
-    "node": "[聊天记录]",
+    "reply": "[回复消息]",
+    "forward": "[合并转发]",
+    "node": "[转发节点]",
     "share": "[分享]",
     "location": "[位置]",
     "music": "[音乐]",
@@ -55,10 +55,37 @@ LABELS = {
     "poke": "[戳一戳]",
     "contact": "[名片]",
     "markdown": "[卡片]",
+    "shake": "[窗口抖动]",
+    "anonymous": "[匿名消息]",
 }
 
 
-def render_message(message_data: list[dict[str, Any]], omit_images: bool = False) -> str:
+def _media_label(kind: str, data: dict[str, Any]) -> str:
+    """Give non-image media a useful, stable summary in text-only cards."""
+    if kind == "record":
+        label = "[语音]"
+    elif kind == "video":
+        label = "[视频]"
+    else:
+        return _file_label(data)
+    name = str(data.get("file_name") or data.get("name") or data.get("file") or "").strip()
+    if name and "." in name and len(name) <= 80:
+        label += f" {name}"
+    size = data.get("file_size") or data.get("size")
+    try:
+        if size:
+            label += f" ({_human_size(int(size))})"
+    except (TypeError, ValueError):
+        pass
+    return label
+
+
+def render_message(
+    message_data: list[dict[str, Any]],
+    omit_images: bool = False,
+    omit_replies: bool = False,
+    omit_forwards: bool = False,
+) -> str:
     parts: list[str] = []
     images = 0
 
@@ -80,12 +107,16 @@ def render_message(message_data: list[dict[str, Any]], omit_images: bool = False
             images += 1
             continue
         flush_images()
+        if kind == "reply" and omit_replies:
+            continue
+        if kind == "forward" and omit_forwards:
+            continue
         if kind == "text":
             parts.append(str(data.get("text", "")))
         elif kind == "at":
             parts.append(f"@{data.get('qq', '某人')}")
-        elif kind == "file":
-            parts.append(_file_label(data))
+        elif kind in ("record", "video", "file"):
+            parts.append(_media_label(kind, data))
         elif kind in ("face", "mface"):
             # 保留 id / 名称，卡片才能把表情画成图而不是占位符（见 common/faces.py）。
             parts.append(face_token(data if isinstance(data, dict) else {}))

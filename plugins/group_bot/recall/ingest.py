@@ -44,6 +44,29 @@ async def save_message(bot: Bot, event: GroupMessageEvent) -> None:
                 datetime.fromtimestamp(event.time, timezone.utc).isoformat(),
             ),
         )
+        # A recall notice can be delivered before this message handler finishes.
+        # Keep the notice as the source of truth and replay its timestamp onto a
+        # message that arrives afterward.
+        await db.execute(
+            """UPDATE messages
+                  SET recalled_at=COALESCE(
+                          recalled_at,
+                          (SELECT recalled_at FROM recall_events
+                            WHERE group_id=? AND message_id=?)),
+                      recalled_by=CASE WHEN EXISTS(
+                          SELECT 1 FROM recall_events
+                           WHERE group_id=? AND message_id=?
+                      ) THEN COALESCE(recalled_by, '') ELSE recalled_by END
+                WHERE group_id=? AND message_id=?""",
+            (
+                str(event.group_id),
+                str(event.message_id),
+                str(event.group_id),
+                str(event.message_id),
+                str(event.group_id),
+                str(event.message_id),
+            ),
+        )
         await db.commit()
     # 多媒体永久归档（图片 / 视频 / 语音 / 文件）：后台任务，不阻塞消息处理；
     # 失败由启动与定时的补归档扫描兜底（见 archive.archive_pending）。
@@ -54,7 +77,14 @@ async def save_message(bot: Bot, event: GroupMessageEvent) -> None:
 async def mark_recalled(event: GroupRecallNoticeEvent) -> None:
     recalled_at = datetime.now(timezone.utc).isoformat()
     async with connect() as db:
-        cursor = await db.execute(
+        # Insert first so a notice racing ahead of message ingestion is not
+        # dropped.  The later save_message() call joins this event to the row.
+        await db.execute(
+            "INSERT OR IGNORE INTO recall_events(group_id, message_id, recalled_at) "
+            "VALUES (?, ?, ?)",
+            (str(event.group_id), str(event.message_id), recalled_at),
+        )
+        await db.execute(
             "UPDATE messages SET recalled_at=?, recalled_by=? "
             "WHERE message_id=? AND group_id=?",
             (
@@ -64,10 +94,4 @@ async def mark_recalled(event: GroupRecallNoticeEvent) -> None:
                 str(event.group_id),
             ),
         )
-        if cursor.rowcount:
-            await db.execute(
-                "INSERT OR IGNORE INTO recall_events(group_id, message_id, recalled_at) "
-                "VALUES (?, ?, ?)",
-                (str(event.group_id), str(event.message_id), recalled_at),
-            )
         await db.commit()

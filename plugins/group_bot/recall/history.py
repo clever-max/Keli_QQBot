@@ -14,7 +14,7 @@ import httpx
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot, MessageSegment
 
-from ..common.card import CardEntry, page_size_for, paginate, render_card_page
+from ..common.card import CardEntry, CardQuote, page_size_for, paginate, render_card_page
 from ..core.config import (
     GROUP_TIMEZONE,
     MEDIA_CACHE_DIR,
@@ -28,7 +28,10 @@ from ..media.pipeline import (
     cached_image_paths,
     cached_image_paths_from_json,
 )
+from ..media.archive import archive_message, archived_media_paths
+from ..media.files import file_name, send_original_file
 from ..common.render import render_message
+from ..common.replies import ReplyPreview, forward_ids, load_forward_previews, load_reply_previews
 from ..core.state import _avatar_warm_tasks, _recall_locks
 from ..common.bot_info import group_name_for
 from ..common.safety import guard
@@ -70,6 +73,43 @@ async def send_cards(bot: Bot, request: RecallRequest, message: Any) -> Any:
     return await _deliver(bot, request, message, to_group=not request.private)
 
 
+async def send_recall_videos(
+    bot: Bot, request: RecallRequest, rows: list[Any]
+) -> None:
+    """Send archived original videos belonging to one already-rendered page."""
+    for row in rows:
+        for path in row.get("_video_paths", []):
+            result = await send_cards(
+                bot,
+                request,
+                MessageSegment("video", {"file": path.resolve().as_uri()}),
+            )
+            if isinstance(result, dict) and result.get("status") == "failed":
+                raise RuntimeError("OneBot failed to send recalled video")
+
+
+async def send_recall_files(
+    bot: Bot, request: RecallRequest, rows: list[Any]
+) -> None:
+    """Send archived original files belonging to one already-rendered page.
+
+    与漂流瓶的文件投递共用 ``send_original_file``：群里走 ``upload_group_file``，
+    私聊走 ``upload_private_file``，保证同一种消息各处表达一致。
+    """
+    for row in rows:
+        paths = row.get("_file_paths", [])
+        names = row.get("_file_names", [])
+        for index, path in enumerate(paths):
+            name = names[index] if index < len(names) else path.name
+            await send_original_file(
+                bot,
+                path,
+                name,
+                group_id=None if request.private else request.group_id,
+                user_id=request.user_id if request.private else None,
+            )
+
+
 async def send_notice(bot: Bot, request: RecallRequest, message: Any) -> Any:
     """Send one text notice to the channel the command was typed in."""
     return await _deliver(bot, request, message, to_group=request.from_group)
@@ -81,10 +121,18 @@ def render_recall_page(
     """Describe the recalled rows to the shared card renderer."""
     entries: list[CardEntry] = []
     for row in rows:
+        preview = row.get("_reply_preview") or row.get("_forward_preview")
+        has_reply = preview is not None and row.get("_reply_preview") is not None
+        has_forward = row.get("_forward_preview") is not None
         try:
             message_data = json.loads(row["message_json"])
             has_image_segment = any(segment.get("type") == "image" for segment in message_data)
-            text = render_message(message_data, omit_images=True)
+            text = render_message(
+                message_data,
+                omit_images=True,
+                omit_replies=has_reply,
+                omit_forwards=has_forward,
+            )
         except (json.JSONDecodeError, TypeError):
             text = str(row["plain_text"] or "[非文本消息]")
             has_image_segment = "[图片]" in text
@@ -92,6 +140,7 @@ def render_recall_page(
                 text = text.replace("[图片]", "").strip()
         image_paths = cached_image_paths(row)
         shown_images = image_paths[:4]
+        quote = _card_quote(row.get("_reply_preview") or row.get("_forward_preview"))
         entries.append(
             CardEntry(
                 user_id=str(row["user_id"]),
@@ -106,6 +155,7 @@ def render_recall_page(
                 image_paths=shown_images,
                 image_note="图片暂不可用" if has_image_segment and not shown_images else "",
                 extra_images=max(0, len(image_paths) - len(shown_images)),
+                quote=quote,
             )
         )
     display_group_name = " ".join(str(group_name).split())[:28] or "本群"
@@ -116,6 +166,51 @@ def render_recall_page(
         group_id=group_id,
         directory=RECALL_IMAGE_DIR,
     )
+
+
+def _card_quote(preview: ReplyPreview | None) -> CardQuote | None:
+    if preview is None:
+        return None
+    meta = ""
+    if preview.sent_at:
+        try:
+            meta = datetime.fromisoformat(preview.sent_at).astimezone(GROUP_TIMEZONE).strftime("%m-%d %H:%M")
+        except (TypeError, ValueError):
+            pass
+    return CardQuote(
+        title=preview.title,
+        name=preview.sender_name,
+        meta_text=meta or ("未归档" if preview.missing else ""),
+        text=preview.text,
+        image_paths=list(preview.image_paths),
+    )
+
+
+async def _mark_summoned(group_id: str, event_ids: list[int], summoned_at: str) -> int:
+    """Commit one successfully delivered page before sending the next one."""
+    if not event_ids:
+        return 0
+    placeholders = ",".join("?" * len(event_ids))
+    async with connect() as db:
+        cursor = await db.execute(
+            f"""UPDATE recall_events SET summoned_at=?
+                WHERE group_id=? AND summoned_at IS NULL
+                  AND event_id IN ({placeholders})""",
+            (summoned_at, group_id, *event_ids),
+        )
+        await db.execute(
+            """INSERT OR IGNORE INTO recall_cursor(group_id, last_event_id)
+               VALUES (?, 0)""",
+            (group_id,),
+        )
+        await db.execute(
+            """UPDATE recall_cursor
+                  SET last_event_id=MAX(last_event_id, ?), last_summoned_at=?
+                WHERE group_id=?""",
+            (max(event_ids), summoned_at, group_id),
+        )
+        await db.commit()
+        return int(cursor.rowcount or 0)
 
 
 async def clear_pending_recall(group_id: str) -> int:
@@ -255,6 +350,77 @@ async def send_recall_history(
             await send_notice(bot, request, empty_recall_text(recent, total, all_pending))
             return 0
 
+        parsed_messages: list[list[dict[str, Any]]] = []
+        for row in rows:
+            try:
+                message_data = json.loads(row["message_json"])
+                parsed_messages.append(message_data if isinstance(message_data, list) else [])
+            except (json.JSONDecodeError, TypeError):
+                parsed_messages.append([])
+        reply_previews = await load_reply_previews(group_id, parsed_messages)
+        forward_previews = await load_forward_previews(bot, parsed_messages)
+        video_message_ids = [
+            str(row["message_id"])
+            for row, message_data in zip(rows, parsed_messages)
+            if any(
+                isinstance(segment, dict) and segment.get("type") == "video"
+                for segment in message_data
+            )
+        ]
+        video_paths = await archived_media_paths(group_id, video_message_ids)
+        # The background archiver normally wins this race.  If a user asks for
+        # a just-sent video before it finishes, make one bounded retry now so
+        # recall can still return the original file.
+        for row, message_data in zip(rows, parsed_messages):
+            message_id = str(row["message_id"])
+            if message_id not in video_message_ids or video_paths.get(message_id):
+                continue
+            try:
+                await archive_message(bot, group_id, message_id, message_data, reason="recall")
+            except Exception:
+                logger.debug("Could not archive recalled video {}", message_id, exc_info=True)
+        video_paths = await archived_media_paths(group_id, video_message_ids)
+        file_message_ids = [
+            str(row["message_id"])
+            for row, message_data in zip(rows, parsed_messages)
+            if any(
+                isinstance(segment, dict) and segment.get("type") == "file"
+                for segment in message_data
+            )
+        ]
+        file_paths = await archived_media_paths(group_id, file_message_ids, kind="file")
+        for row, message_data in zip(rows, parsed_messages):
+            message_id = str(row["message_id"])
+            if message_id not in file_message_ids or file_paths.get(message_id):
+                continue
+            try:
+                await archive_message(bot, group_id, message_id, message_data, reason="recall")
+            except Exception:
+                logger.debug("Could not archive recalled file {}", message_id, exc_info=True)
+        file_paths = await archived_media_paths(group_id, file_message_ids, kind="file")
+        for row, message_data in zip(rows, parsed_messages):
+            ids = [
+                str(segment.get("data", {}).get("id"))
+                for segment in message_data
+                if isinstance(segment, dict) and segment.get("type") == "reply"
+            ]
+            if ids and ids[0] in reply_previews:
+                row["_reply_preview"] = reply_previews[ids[0]]
+            forward_ids_for_row = forward_ids(message_data)
+            if forward_ids_for_row and forward_ids_for_row[0] in forward_previews:
+                row["_forward_preview"] = forward_previews[forward_ids_for_row[0]]
+            row["_video_paths"] = video_paths.get(str(row["message_id"]), [])
+            file_segments = [
+                segment
+                for segment in message_data
+                if isinstance(segment, dict) and segment.get("type") == "file"
+            ]
+            row["_file_names"] = [
+                file_name(segment.get("data") or {}, index)
+                for index, segment in enumerate(file_segments)
+            ]
+            row["_file_paths"] = file_paths.get(str(row["message_id"]), [])
+
         group_name = await group_name_for(bot, request.group_id, request.group_name)
 
         # Wait for the initial full-group cache; then fill any missing senders.
@@ -295,6 +461,7 @@ async def send_recall_history(
         max_images = max((len(cached_image_paths(row)) for row in rows), default=0)
         chunks = paginate(rows, page_size_for(max_images))
         files: list[Path] = []
+        summoned_count = 0
         try:
             # 分页后可能有好几张，逐页在线程里渲染：一次请求能画出数秒的 CPU 活，
             # 放在事件循环里会连带挡住心跳与其它群的消息处理。
@@ -309,43 +476,39 @@ async def send_recall_history(
                 )
                 for page, chunk in enumerate(chunks)
             ]
-            for path in files:
+            for path, chunk in zip(files, chunks):
                 result = await send_cards(
                     bot, request, MessageSegment.image(path.resolve().as_uri())
                 )
                 if isinstance(result, dict) and result.get("status") == "failed":
                     raise RuntimeError("OneBot failed to send recall image")
+                await send_recall_videos(bot, request, chunk)
+                await send_recall_files(bot, request, chunk)
+                summoned_count += await _mark_summoned(
+                    group_id,
+                    [int(row["event_id"]) for row in chunk],
+                    datetime.now(timezone.utc).isoformat(),
+                )
         except Exception:
             logger.exception("Could not send recall image batch")
             await send_notice(
                 bot,
                 request,
-                "撤回记录图片发送失败；记录没有标记为已召回，可以稍后重试。",
+                (
+                    f"撤回记录已发送 {summoned_count} 条，但后续页面发送失败；"
+                    "剩余记录可以稍后重试。"
+                    if summoned_count
+                    else "撤回记录图片发送失败；记录没有标记为已召回，可以稍后重试。"
+                ),
             )
-            return 0
+            return summoned_count
         finally:
             for path in files:
                 path.unlink(missing_ok=True)
 
-        # Only what was actually drawn counts as summoned; anything older than the
-        # window (or beyond the requested count) stays pending on purpose.
-        summoned_at = datetime.now(timezone.utc).isoformat()
-        event_ids = [int(row["event_id"]) for row in rows]
-        placeholders = ",".join("?" * len(event_ids))
-        async with connect() as db:
-            await db.execute(
-                f"""UPDATE recall_events SET summoned_at=?
-                    WHERE group_id=? AND event_id IN ({placeholders})""",
-                (summoned_at, group_id, *event_ids),
-            )
-            await db.execute(
-                """UPDATE recall_cursor
-                   SET last_event_id=MAX(last_event_id, ?), last_summoned_at=?
-                   WHERE group_id=?""",
-                (max(event_ids), summoned_at, group_id),
-            )
-            await db.commit()
-        return len(event_ids)
+        # Each page was marked immediately after its send.  Anything older than
+        # the window (or beyond the requested count) remains pending on purpose.
+        return summoned_count
 
 
 async def safe_send_recall_history(

@@ -82,6 +82,7 @@ while ($root -and -not (Test-Path -LiteralPath (Join-Path $root 'bot.py'))) {
 - **`.ps1` 必须存成 UTF-8 带 BOM。** 少了 BOM，Windows PowerShell 5.1 会按 ANSI 代码页
   读文件，中文字符串字面量被解码成乱码，`switch` / 字符串分支会直接**语法报错**
   （实测：`commit-iteration.ps1` 的 `"chore" { return "工具链" }` 变成 `宸ュ叿閾?`）。
+  PowerShell 7 能读无 BOM 的文件，但为了 5.1 兼容，这条要求不放松。
 - **`.cmd` 不能带 BOM**：`cmd.exe` 会把 BOM 当成首行命令的一部分而报错。
 - **Markdown 不带 BOM**（与仓库其余文档一致）。
 

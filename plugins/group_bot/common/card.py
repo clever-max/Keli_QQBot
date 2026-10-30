@@ -58,6 +58,9 @@ CARD_SURFACE = (255, 255, 255)
 CARD_BUBBLE = (241, 244, 250)
 CARD_BUBBLE_OUTLINE = (226, 232, 243)
 CARD_BUBBLE_SHADOW = (231, 236, 246)
+CARD_QUOTE = (248, 249, 252)
+CARD_QUOTE_OUTLINE = (225, 230, 239)
+CARD_QUOTE_TEXT = (91, 101, 118)
 CARD_TEXT = (38, 44, 55)
 CARD_NAME = (32, 39, 51)
 CARD_META = (128, 137, 152)
@@ -70,7 +73,25 @@ T = TypeVar("T")
 # 一行正文的排版结果：文字/表情单元列表。
 RichLine = list[richtext.Run]
 # 测量阶段缓存下来的：条目、折好的行、整行高度、图片缩略图。
-MeasuredEntry = tuple["CardEntry", list[RichLine], int, list[tuple[Path, tuple[int, int]]]]
+MeasuredEntry = tuple[
+    "CardEntry",
+    list[RichLine],
+    int,
+    list[tuple[Path, tuple[int, int]]],
+    list[RichLine],
+    tuple[Path, tuple[int, int]] | None,
+]
+
+
+@dataclass
+class CardQuote:
+    """A compact preview of the message referenced by a reply segment."""
+
+    title: str = "回复"
+    name: str = "群成员"
+    meta_text: str = ""
+    text: str = ""
+    image_paths: list[Path] = field(default_factory=list)
 
 
 @dataclass
@@ -85,6 +106,7 @@ class CardEntry:
     image_paths: list[Path] = field(default_factory=list)
     image_note: str = ""
     extra_images: int = 0
+    quote: CardQuote | None = None
 
 
 def display_name(name: object) -> str:
@@ -178,6 +200,8 @@ def render_card_page(
     meta_font = font(20)
     body_font = font(23)
     body_font_size = 23
+    quote_font = font(19)
+    quote_font_size = 19
     face_size = max(body_font_size, int(round(body_font_size * CARD_FACE_SCALE)))
     measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
     line_height = CARD_BODY_LINE_HEIGHT
@@ -201,8 +225,32 @@ def render_card_page(
             if size is None:
                 continue
             frames.append((image_path, size))
+        quote_lines: list[RichLine] = []
+        quote_frame: tuple[Path, tuple[int, int]] | None = None
+        if entry.quote is not None:
+            quote = entry.quote
+            quote_text = (quote.text or "")[:800]
+            if quote_text:
+                quote_lines = richtext.wrap(
+                    quote_text,
+                    quote_font,
+                    body_width - 2 * CARD_BUBBLE_PAD_X,
+                    quote_font_size,
+                )
+            for image_path in quote.image_paths[:1]:
+                size = fitted_size(image_path, 180, 120)
+                if size is not None:
+                    quote_frame = (image_path, size)
+                    break
         image_rows = (len(frames) + thumb_columns - 1) // thumb_columns
         cursor = CARD_BODY_TOP
+        if entry.quote is not None:
+            quote_height = 18 + quote_font_size + 8
+            if quote_lines:
+                quote_height += bubble_size(quote_lines, 32, quote_font_size)
+            if quote_frame is not None:
+                quote_height += quote_frame[1][1] + 10
+            cursor += quote_height + 12
         if lines:
             cursor += bubble_size(lines, line_height, body_font_size) + 14
         if entry.image_note:
@@ -213,11 +261,11 @@ def render_card_page(
         if entry.extra_images > 0:
             cursor += 30
         height = max(126, cursor + 18)
-        measured.append((entry, lines, height, frames))
+        measured.append((entry, lines, height, frames, quote_lines, quote_frame))
 
     total_height = (
         header_height
-        + sum(height + CARD_ROW_GAP for _, _, height, _ in measured)
+        + sum(height + CARD_ROW_GAP for _, _, height, _, _, _ in measured)
         - CARD_ROW_GAP
         + margin
     )
@@ -242,7 +290,7 @@ def render_card_page(
     )
 
     y = header_height
-    for entry, lines, height, frames in measured:
+    for entry, lines, height, frames, quote_lines, quote_frame in measured:
         _soft_round_rect(
             draw,
             (20, y, CARD_WIDTH - 20, y + height),
@@ -279,6 +327,62 @@ def render_card_page(
             )
 
         content_y = y + CARD_BODY_TOP
+        if entry.quote is not None:
+            quote = entry.quote
+            quote_height = 18 + quote_font_size + 8
+            if quote_lines:
+                quote_height += bubble_size(quote_lines, 32, quote_font_size)
+            if quote_frame is not None:
+                quote_height += quote_frame[1][1] + 10
+            _soft_round_rect(
+                draw,
+                (body_x, content_y, body_x + body_width, content_y + quote_height),
+                12,
+                CARD_QUOTE,
+                outline=CARD_QUOTE_OUTLINE,
+            )
+            quote_title = f"{quote.title} {display_name(quote.name)}"
+            quote_font.draw(draw, (body_x + CARD_BUBBLE_PAD_X, content_y + 8), quote_title, fill=CARD_QUOTE_TEXT)
+            if quote.meta_text:
+                meta_font.draw(
+                    draw,
+                    (body_x + body_width - CARD_BUBBLE_PAD_X, content_y + 9),
+                    quote.meta_text,
+                    fill=CARD_META,
+                    anchor="ra",
+                )
+            quote_content_y = content_y + 30
+            for index, line in enumerate(quote_lines):
+                richtext.draw(
+                    canvas,
+                    draw,
+                    (body_x + CARD_BUBBLE_PAD_X, quote_content_y + index * 32),
+                    line,
+                    quote_font,
+                    quote_font_size,
+                    CARD_QUOTE_TEXT,
+                    face_top=CARD_FACE_TOP,
+                )
+            if quote_frame is not None:
+                quote_path, (quote_width, quote_height_px) = quote_frame
+                quote_content_y += bubble_size(quote_lines, 32, quote_font_size) if quote_lines else 0
+                quote_content_y += 8
+                try:
+                    with Image.open(quote_path) as source:
+                        fitted = ImageOps.contain(
+                            source.convert("RGB"),
+                            (quote_width, quote_height_px),
+                            method=Image.Resampling.LANCZOS,
+                        )
+                    frame = Image.new("RGB", (quote_width, quote_height_px), CARD_THUMB_BACKDROP)
+                    frame.paste(
+                        fitted,
+                        ((quote_width - fitted.width) // 2, (quote_height_px - fitted.height) // 2),
+                    )
+                    canvas.paste(frame, (body_x + CARD_BUBBLE_PAD_X, quote_content_y))
+                except OSError:
+                    pass
+            content_y += quote_height + 12
         if lines:
             bubble_h = bubble_size(lines, line_height, body_font_size)
             bubble_w = min(

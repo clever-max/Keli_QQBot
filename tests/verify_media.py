@@ -55,6 +55,7 @@ from plugins.group_bot.core.config import (  # noqa: E402
     RECALL_THUMB_SIZE,
 )
 from plugins.group_bot.bottle.essence import (  # noqa: E402
+    ChosenBottle,
     bottle_hint_text,
     choose_album_photo,
     choose_essence,
@@ -340,12 +341,199 @@ async def check_video_draw() -> None:
     )
 
 
+async def check_file_draw() -> None:
+    print("\n== 12. 文件类精华：选择与提示 ==")
+    file_part = {
+        "file": "报告.pdf",
+        "file_name": "报告.pdf",
+        "file_size": "2048",
+        "url": "https://x.qpic.cn/report.pdf",
+    }
+    file_essence = {
+        "message_id": 901,
+        "sender_id": "11",
+        "sender_nick": "甲",
+        "operator_id": "22",
+        "operator_nick": "乙",
+        "operator_time": 1759300000,
+        "content": [{"type": "file", "data": file_part}],
+    }
+    async with connect() as db:
+        await db.execute("DELETE FROM essence_draws WHERE group_id=?", (str(GROUP),))
+        await db.commit()
+    chosen = await choose_essence(
+        SimpleNamespace(), GROUP, [file_essence], day=local_day_key()
+    )
+    check("文件精华被选中", chosen.item["message_id"], 901)
+    check("文件段被识别", len(chosen.file_parts), 1)
+    check("文件不走视频分支", chosen.video_ref, "")
+    check("文件不做图片物化", chosen.image_paths, [])
+    hint = bottle_hint_text(chosen, 3, 0, 2)
+    check_true("提示说明是文件", "一个文件" in hint)
+    check_true("提示带文件名", "报告.pdf" in hint)
+
+    mp4_essence = {
+        "message_id": 902,
+        "sender_id": "11",
+        "sender_nick": "甲",
+        "content": [
+            {
+                "type": "file",
+                "data": {
+                    "file": "片段.mp4",
+                    "file_name": "片段.mp4",
+                    "file_size": "4096",
+                    "url": "https://x.qpic.cn/clip.mp4",
+                },
+            }
+        ],
+    }
+    mp4_chosen = await choose_essence(
+        SimpleNamespace(), GROUP, [mp4_essence], day=local_day_key()
+    )
+    check_true(
+        "视频文件仍走文件分支（不是 video_ref）",
+        bool(mp4_chosen.file_parts) and mp4_chosen.video_ref == "",
+    )
+
+    print("\n== 13. send_bottle 发原文件 + 文字提示 ==")
+    archive = MEDIA / "报告.pdf"
+    archive.write_bytes(b"%PDF-1.4 fake")
+
+    async def fake_archived(group_id, message_ids, *, kind="video"):
+        return {str(message_ids[0]): [archive]} if kind == "file" else {}
+
+    async def fake_choose(bot, group_id, *, day, album_only=False):
+        return ChosenBottle(
+            "essence", file_essence, [], 0, "ok", 1, "", (dict(file_part),)
+        )
+
+    setattr(gb_flow, "archived_media_paths", fake_archived)
+    setattr(gb_flow, "choose_bottle", fake_choose)
+
+    class FileBot:
+        def __init__(self, fail: bool = False):
+            self.messages: list = []
+            self.uploads: list[dict] = []
+            self.fail = fail
+            self.self_id = "100000000"
+
+        async def send_group_msg(self, **kwargs):
+            self.messages.append(kwargs["message"])
+            return {"status": "ok"}
+
+        async def call_api(self, action, **kwargs):
+            if action != "upload_group_file":
+                raise AssertionError(f"unexpected action: {action}")
+            if self.fail:
+                raise RuntimeError("upload failed")
+            self.uploads.append(kwargs)
+            return {}
+
+    async def used_count(group_id, user_id) -> int:
+        async with connect() as db:
+            cursor = await db.execute(
+                "SELECT used FROM essence_usage WHERE group_id=? AND user_id=?",
+                (str(group_id), str(user_id)),
+            )
+            row = await cursor.fetchone()
+            return int(row["used"]) if row else 0
+
+    async def draw_count(group_id) -> int:
+        async with connect() as db:
+            cursor = await db.execute(
+                "SELECT COUNT(*) AS n FROM essence_draws WHERE group_id=?",
+                (str(group_id),),
+            )
+            return int((await cursor.fetchone())["n"])
+
+    user = 777777778
+    async with connect() as db:
+        await db.execute("DELETE FROM essence_usage WHERE user_id=?", (str(user),))
+        await db.execute("DELETE FROM essence_draws WHERE group_id=?", (str(GROUP),))
+        await db.commit()
+
+    bot = FileBot()
+    event = SimpleNamespace(group_id=GROUP, user_id=user, group_name="测试群")
+    await send_bottle(bot, event)
+    check("上传一次文件", len(bot.uploads), 1)
+    check("上传的是归档原文件", bot.uploads[0].get("file"), str(archive))
+    check("上传时带文件名", bot.uploads[0].get("name"), "报告.pdf")
+    check("只发一条文字提示（没有卡片）", len(bot.messages), 1)
+    check_true("提示说明是文件", "一个文件" in str(bot.messages[0]))
+    check_true("提示带文件名", "报告.pdf" in str(bot.messages[0]))
+    check("成功不退次数", await used_count(GROUP, user), 1)
+    check("成功记录抽取", await draw_count(GROUP), 1)
+    check_true("归档文件没有被删", archive.is_file())
+
+    print("\n== 14. 文件上传失败 -> 退次数 + 提示 ==")
+    async with connect() as db:
+        await db.execute("DELETE FROM essence_usage WHERE user_id=?", (str(user),))
+        await db.execute("DELETE FROM essence_draws WHERE group_id=?", (str(GROUP),))
+        await db.commit()
+    bot = FileBot(fail=True)
+    await send_bottle(bot, event)
+    check("失败后次数已退还", await used_count(GROUP, user), 0)
+    check("失败没有记录抽取", await draw_count(GROUP), 0)
+    check_true(
+        "失败提示提到文件",
+        any(isinstance(m, str) and "文件" in m for m in bot.messages),
+    )
+
+    print("\n== 15. 没有归档时按 url 下载，发完删临时文件 ==")
+
+    async def fake_archived_empty(group_id, message_ids, *, kind="video"):
+        return {}
+
+    temp_source = MEDIA / "downloaded.pdf"
+    temp_source.write_bytes(b"%PDF-1.4 downloaded")
+
+    async def fake_download(part, index):
+        return temp_source
+
+    setattr(gb_flow, "archived_media_paths", fake_archived_empty)
+    setattr(gb_flow, "_download_file_part", fake_download)
+    async with connect() as db:
+        await db.execute("DELETE FROM essence_usage WHERE user_id=?", (str(user),))
+        await db.execute("DELETE FROM essence_draws WHERE group_id=?", (str(GROUP),))
+        await db.commit()
+    bot = FileBot()
+    await send_bottle(bot, event)
+    check("没有归档也能上传", len(bot.uploads), 1)
+    check_true("上传用到临时文件", str(temp_source) in str(bot.uploads[0].get("file")))
+    check_true("临时文件发送后删除", not temp_source.exists())
+
+    print("\n== 16. 精华视频与相册视频：同一表达 ==")
+    video_item = {
+        "message_id": 903,
+        "sender_nick": "甲",
+        "operator_nick": "乙",
+        "content": [{"type": "video", "data": {"url": "https://y/v.mp4"}}],
+    }
+
+    async def choose_video(bot, group_id, *, day, album_only=False):
+        return ChosenBottle("essence", video_item, [], 0, "ok", 1, "https://y/v.mp4")
+
+    setattr(gb_flow, "choose_bottle", choose_video)
+    async with connect() as db:
+        await db.execute("DELETE FROM essence_usage WHERE user_id=?", (str(user),))
+        await db.execute("DELETE FROM essence_draws WHERE group_id=?", (str(GROUP),))
+        await db.commit()
+    bot = FileBot()
+    await send_bottle(bot, event)
+    check("精华视频也发 video 段", bot.messages[0].type, "video")
+    check("精华视频引用正确", bot.messages[0].data.get("file"), "https://y/v.mp4")
+    check_true("精华视频提示也是「一段视频」", "一段视频" in str(bot.messages[1]))
+    check("精华视频不上传文件", len(bot.uploads), 0)
+
+
 async def main() -> None:
     await initialize_database()
     check_card_size()
     check_cache_keeps_original()
     check_album_url_quality()
     await check_video_draw()
+    await check_file_draw()
 
     print("\n" + "=" * 60)
     if failures:

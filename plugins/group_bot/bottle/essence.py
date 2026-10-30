@@ -44,6 +44,7 @@ from .pool import (
     choose_essence,
     draw_history,
     drawn_message_ids,
+    essence_file_parts,
     essence_image_segments,
     essence_pool_size,
     essence_text,
