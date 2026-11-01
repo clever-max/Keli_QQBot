@@ -26,7 +26,9 @@ import binascii
 import hashlib
 import json
 import os
+import tempfile
 import time
+import weakref
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -58,6 +60,37 @@ def _semaphore() -> asyncio.Semaphore:
     if _SEMAPHORE is None:  # 懒创建：必须在事件循环里
         _SEMAPHORE = asyncio.Semaphore(_ARCHIVE_CONCURRENCY)
     return _SEMAPHORE
+
+
+# One HTTP client per event loop: archive_message is called per message, and a
+# fresh AsyncClient each time paid for a new connection pool on every small image.
+_CLIENTS: "weakref.WeakKeyDictionary[Any, httpx.AsyncClient]" = weakref.WeakKeyDictionary()
+_HTTP_TIMEOUT = httpx.Timeout(connect=4.0, read=10.0, write=10.0, pool=4.0)
+
+
+def _http_client() -> httpx.AsyncClient:
+    loop = asyncio.get_running_loop()
+    client = _CLIENTS.get(loop)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient(timeout=_HTTP_TIMEOUT, follow_redirects=True)
+        _CLIENTS[loop] = client
+    return client
+
+
+def _atomic_write(destination: Path, content: bytes) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        dir=str(destination.parent), prefix=f".{destination.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "wb") as file_obj:
+            file_obj.write(content)
+        os.replace(temp_name, destination)
+    finally:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
 
 
 def stored_path(sha256: str, suffix: str) -> Path:
@@ -196,12 +229,13 @@ async def _store(
     content: bytes,
 ) -> tuple[str, int, str]:
     kind = str(segment.get("type") or "file")
-    digest = hashlib.sha256(content).hexdigest()
+    # 77 MiB 的哈希实测约 438 ms；放在事件循环里会卡住心跳和别的群消息。
+    digest = await asyncio.to_thread(hashlib.sha256, content)
+    digest = digest.hexdigest()
     suffix = _guess_suffix(segment, kind, content)
     destination = stored_path(digest, suffix)
     if not destination.exists() or destination.stat().st_size != len(content):
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        await asyncio.to_thread(destination.write_bytes, content)
+        await asyncio.to_thread(_atomic_write, destination, content)
     return digest, len(content), suffix
 
 
@@ -240,64 +274,63 @@ async def archive_message(
     async with _semaphore():
         # 老消息的 URL 多半已过期：DNS/连接会一直等到超时。给个短超时，
         # 否则一晚上都扫不完（实测 30 s 超时下，50 条死链能卡住十几分钟）。
-        timeout = httpx.Timeout(connect=4.0, read=10.0, write=10.0, pool=4.0)
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            for index, segment in media:
-                data = segment.setdefault("data", {})
-                source_url = str(data.get("url") or data.get("file") or "")
-                kind = str(segment.get("type"))
-                try:
-                    # 外层再套一道硬超时：httpx 的 read 超时只管"两次读之间"，遇到慢速
-                    # 滴流或卡住的 DNS 仍可能无限期挂着（实测把整个补归档卡死）。
-                    content, reason = await asyncio.wait_for(
-                        _download(bot, segment, client), timeout=_FETCH_TIMEOUT
-                    )
-                except asyncio.TimeoutError:
-                    rows.append(
-                        (
-                            group_id, message_id, index, kind,
-                            "", 0, "", source_url, _now(),
-                            f"下载超时（超过 {_FETCH_TIMEOUT:.0f} 秒）",
-                        )
-                    )
-                    logger.warning(
-                        "Archive: {} of {}-{} timed out", kind, group_id, message_id
-                    )
-                    continue
-                except Exception as error:  # noqa: BLE001  单段失败不能连累整条消息
-                    rows.append(
-                        (
-                            group_id, message_id, index, kind,
-                            "", 0, "", source_url, _now(),
-                            f"下载失败: {type(error).__name__}: {error}",
-                        )
-                    )
-                    logger.warning(
-                        "Archive: could not fetch {} of {}-{}: {}",
-                        kind, group_id, message_id, error,
-                    )
-                    continue
-                if not content:
-                    rows.append(
-                        (
-                            group_id, message_id, index, kind,
-                            "", 0, "", source_url, _now(), reason or "取不到内容",
-                        )
-                    )
-                    logger.info(
-                        "Archive: {} of {}-{} not stored: {}", kind, group_id, message_id, reason
-                    )
-                    continue
-                digest, size, suffix = await _store(
-                    group_id, message_id, index, segment, content
+        client = _http_client()
+        for index, segment in media:
+            data = segment.setdefault("data", {})
+            source_url = str(data.get("url") or data.get("file") or "")
+            kind = str(segment.get("type"))
+            try:
+                # 外层再套一道硬超时：httpx 的 read 超时只管"两次读之间"，遇到慢速
+                # 滴流或卡住的 DNS 仍可能无限期挂着（实测把整个补归档卡死）。
+                content, reason = await asyncio.wait_for(
+                    _download(bot, segment, client), timeout=_FETCH_TIMEOUT
                 )
+            except asyncio.TimeoutError:
                 rows.append(
                     (
                         group_id, message_id, index, kind,
-                        digest, size, suffix, source_url, _now(), "",
+                        "", 0, "", source_url, _now(),
+                        f"下载超时（超过 {_FETCH_TIMEOUT:.0f} 秒）",
                     )
                 )
-                stored += 1
+                logger.warning(
+                    "Archive: {} of {}-{} timed out", kind, group_id, message_id
+                )
+                continue
+            except Exception as error:  # noqa: BLE001  单段失败不能连累整条消息
+                rows.append(
+                    (
+                        group_id, message_id, index, kind,
+                        "", 0, "", source_url, _now(),
+                        f"下载失败: {type(error).__name__}: {error}",
+                    )
+                )
+                logger.warning(
+                    "Archive: could not fetch {} of {}-{}: {}",
+                    kind, group_id, message_id, error,
+                )
+                continue
+            if not content:
+                rows.append(
+                    (
+                        group_id, message_id, index, kind,
+                        "", 0, "", source_url, _now(), reason or "取不到内容",
+                    )
+                )
+                logger.info(
+                    "Archive: {} of {}-{} not stored: {}", kind, group_id, message_id, reason
+                )
+                continue
+            digest, size, suffix = await _store(
+                group_id, message_id, index, segment, content
+            )
+            rows.append(
+                (
+                    group_id, message_id, index, kind,
+                    digest, size, suffix, source_url, _now(), "",
+                )
+            )
+            stored += 1
 
     async with connect() as db:
         await db.executemany(

@@ -24,11 +24,13 @@ from nonebot import logger
 from PIL import Image, ImageDraw, ImageFont
 
 # 缺字回退顺序。主字体（微软雅黑）没有字形时，按这个顺序找第一个有的：
-# 彩色 emoji → 老符号兜底 → 埃塞俄比亚文 → 韩文 → CJK 扩展 B → CJK 扩展 G。
+# 彩色 emoji → 老符号 → 埃塞俄比亚文 → 泰文 → 拉丁语音扩展 → 韩文 → CJK 扩展 B/G。
 FALLBACK_FONTS = (
     "seguiemj.ttf",  # Segoe UI Emoji：emoji，彩色
     "seguisym.ttf",  # Segoe UI Symbol：老符号的宽覆盖兜底
     "ebrima.ttf",  # Ebrima：埃塞俄比亚文等非洲文字
+    "LeelawUI.ttf",  # Leelawadee UI：泰文
+    "segoeui.ttf",  # Segoe UI：拉丁语音扩展（ᴗ / ᴬ 等）
     "malgun.ttf",  # Malgun Gothic：韩文
     "simsunb.ttf",  # SimSun-ExtB：CJK 扩展 B 区生僻字（𠮷 之类）
     "SimsunExtG.ttf",  # SimSun-ExtG：CJK 扩展 G 区

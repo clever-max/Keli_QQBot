@@ -81,6 +81,9 @@ WATER_EXCLUDED_GROUP_IDS = _id_set("WATER_EXCLUDED_GROUP_IDS")
 STATUS_EXCLUDED_GROUP_IDS = _id_set("STATUS_EXCLUDED_GROUP_IDS")
 # 这些群的 help 只讲漂流瓶怎么用，不提撤回记录/总结/管理员权限。
 BOTTLE_ONLY_HELP_GROUP_IDS = _id_set("BOTTLE_ONLY_HELP_GROUP_IDS")
+# 这些群只开放漂流瓶系列命令（漂流瓶/两种榜/help）；撤回记录、总结、点歌、
+# 私聊投递等群内命令一律静默。归档照常。
+BOTTLE_ONLY_GROUP_IDS = _id_set("BOTTLE_ONLY_GROUP_IDS")
 
 
 def is_authorized(group_id: int, user_id: int | str) -> bool:

@@ -424,11 +424,15 @@ async def materialize_photo(
 ) -> Path | None:
     """Download one album picture into the media cache, or ``None`` on failure."""
     MEDIA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha256(f"album:{group_id}:{photo.media_id}".encode("utf-8")).hexdigest()[:32]
+    path = MEDIA_CACHE_DIR / f"{key}.jpg"
+    # Re-downloading the same album photo after it was already rendered is pure
+    # waste; the cache is content-stable and can be rebuilt if deleted.
+    if path.is_file() and path.stat().st_size > 0:
+        return path
     content = await read_remote_image(photo.url, client, ALBUM_IMAGE_SUFFIXES)
     if not content:
         return None
-    key = hashlib.sha256(f"album:{group_id}:{photo.media_id}".encode("utf-8")).hexdigest()[:32]
-    path = MEDIA_CACHE_DIR / f"{key}.jpg"
     try:
         path.write_bytes(content)
     except OSError:

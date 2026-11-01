@@ -32,6 +32,8 @@ from ..media.album import (
 )
 from ..common.card import CardEntry, render_card_page
 from ..core.config import (
+    ALLOWED_GROUP_IDS,
+    BOTTLE_ALBUM_CACHE_SECONDS,
     BOTTLE_ALBUM_ENABLED,
     BOTTLE_ALBUM_SHARE,
     BOTTLE_HISTORY_DAYS,
@@ -52,6 +54,7 @@ from ..media.pipeline import (
 from ..common.render import render_message
 from ..core.state import (
     _album_broken,
+    _album_cache,
     _avatar_warm_tasks,
     _essence_broken,
     _essence_cache,
@@ -580,18 +583,30 @@ async def choose_bottle(
 
     failure: ChosenBottle | None = None
     for kind in order:
+        fetch_started = time.perf_counter()
         if kind == "essence":
             try:
                 items = await fetch_essence_list(bot, group_id)
             except EssenceUnavailable:
                 items = []
+            fetch_done = time.perf_counter()
             chosen = await choose_essence(bot, group_id, items, day=day)
         else:
             try:
                 photos = await fetch_album_photos(bot, group_id)
             except AlbumUnavailable:
                 photos = []
+            fetch_done = time.perf_counter()
             chosen = await choose_album_photo(bot, group_id, photos, day=day)
+        chosen_at = time.perf_counter()
+        if chosen_at - fetch_started > 0.8:
+            logger.info(
+                "Bottle choose timing kind={} fetch={:.2f}s select+materialize={:.2f}s total={:.2f}s",
+                kind,
+                fetch_done - fetch_started,
+                chosen_at - fetch_done,
+                chosen_at - fetch_started,
+            )
         if chosen.item is not None:
             return chosen
         if failure is None or chosen.reason == "unavailable":
@@ -624,3 +639,44 @@ async def album_pool_size(bot: Bot, group_id: int) -> int:
 async def pool_sizes(bot: Bot, group_id: int) -> tuple[int, int]:
     """(精华条数, 相册照片数)，任一来源读不到都当作 0。"""
     return await essence_pool_size(bot, group_id), await album_pool_size(bot, group_id)
+
+
+_CACHE_WARM_TASK: asyncio.Task | None = None
+_CACHE_WARM_BOT: Bot | None = None
+
+
+def start_bottle_cache_warmer(bot: Bot) -> None:
+    """Keep the essence/album caches warm in the background.
+
+    The first draw after a restart used to pay the full cold fetch (measured
+    1.4–7.2 s, mostly album pagination).  Refreshing shortly after connect and
+    then well inside the 600 s TTL moves that cost off the user's request path.
+    """
+    global _CACHE_WARM_TASK, _CACHE_WARM_BOT
+    if _CACHE_WARM_TASK is not None and not _CACHE_WARM_TASK.done():
+        if _CACHE_WARM_BOT is bot:
+            return
+        # OneBot reconnect creates a new Bot object; the old task would keep
+        # calling a dead connection forever.
+        _CACHE_WARM_TASK.cancel()
+    _CACHE_WARM_BOT = bot
+
+    interval = max(120, min(ESSENCE_CACHE_SECONDS, BOTTLE_ALBUM_CACHE_SECONDS) - 120)
+
+    async def loop() -> None:
+        await asyncio.sleep(20)
+        while True:
+            for group_id in sorted(ALLOWED_GROUP_IDS):
+                try:
+                    await asyncio.wait_for(fetch_essence_list(bot, group_id), timeout=45)
+                except Exception:
+                    logger.debug("Bottle cache warm: essence failed for {}", group_id, exc_info=True)
+                if album_pool_enabled():
+                    try:
+                        await asyncio.wait_for(fetch_album_photos(bot, group_id), timeout=90)
+                    except Exception:
+                        logger.debug("Bottle cache warm: album failed for {}", group_id, exc_info=True)
+                await asyncio.sleep(1)
+            await asyncio.sleep(interval)
+
+    _CACHE_WARM_TASK = asyncio.create_task(loop())

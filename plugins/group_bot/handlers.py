@@ -24,6 +24,7 @@ from .runtime.cooldown import (
 )
 from .core.config import (
     ALLOWED_GROUP_IDS,
+    BOTTLE_ONLY_GROUP_IDS,
     BOTTLE_ONLY_HELP_GROUP_IDS,
     ESSENCE_DAILY_LIMIT,
     RECALL_MAX_COUNT,
@@ -40,6 +41,7 @@ from .bottle.essence import (
     safe_send_essence,
     safe_send_essence_leaderboard,
 )
+from .bottle.pool import start_bottle_cache_warmer
 from .media.archive import start_archive_sweeper
 from .recall.ingest import mark_recalled, save_message
 from .media.pipeline import avatar_dir, cache_avatar, schedule_avatar_warm
@@ -48,6 +50,7 @@ from .recall.history import (
     RecallRequest,
     clear_pending_recall,
     clear_recall_text,
+    safe_send_all_recall_history,
     safe_send_recall_history,
 )
 from .core.settings import (
@@ -68,6 +71,8 @@ INCREMENTAL_COMMANDS = {"总结", "增量总结", "最近总结"}
 HELP_COMMANDS = {"help", "帮助", "命令"}
 CLEAR_COMMANDS = {"clear", "清除未召回"}
 RECALL_ALL_WORDS = {"全部", "所有", "all"}
+# 仅私聊主人可用：查看所有已撤回记录（含已经看过的），不改变未读状态。
+RECALL_HISTORY_WORDS = {"历史", "历史记录", "所有记录", "全部记录"}
 # 「撤回记录」的投递方式开关：把卡片发到发起人和机器人的一对一对话里
 # （非好友走群临时会话），而不是发进群。
 RECALL_PRIVATE_WORDS = {"私聊", "私发", "临时会话", "临时对话", "悄悄"}
@@ -166,6 +171,7 @@ class RecallCommand:
     private: bool
     count: int | None
     group_id: int | None
+    history: bool = False
 
 
 def parse_recall_command(text: str) -> RecallCommand | None:
@@ -179,11 +185,14 @@ def parse_recall_command(text: str) -> RecallCommand | None:
         return None
     all_pending = False
     private = False
+    history = False
     count: int | None = None
     group_id: int | None = None
     for token in tokens[1:]:
         if token.casefold() in RECALL_ALL_WORDS:
             all_pending = True
+        elif token in RECALL_HISTORY_WORDS:
+            history = True
         elif token in RECALL_PRIVATE_WORDS:
             private = True
         elif re.fullmatch(r"\d{1,3}", token):
@@ -197,7 +206,7 @@ def parse_recall_command(text: str) -> RecallCommand | None:
             group_id = int(token)
         else:
             return None
-    return RecallCommand(all_pending, private, count, group_id)
+    return RecallCommand(all_pending, private, count, group_id, history)
 
 
 @dataclass(frozen=True)
@@ -250,6 +259,16 @@ def is_recognized_command(text: str, folded: str) -> bool:
     if parse_toggle_command(text) is not None:
         return True
     return parse_recall_command(text) is not None
+
+
+def bottle_only_allowed(text: str, folded: str) -> bool:
+    """Bottle-only groups: stick to bottle commands + help, silence everything else."""
+    return (
+        parse_bottle_command(text) is not None
+        or folded in BOTTLE_RANK_COMMANDS
+        or folded in DRAWN_RANK_COMMANDS
+        or folded in HELP_COMMANDS
+    )
 
 
 def _bullets(lines: list[str]) -> str:
@@ -326,7 +345,7 @@ def bottle_help() -> str:
 
 def group_help(group_id: int, *, is_admin: bool) -> str:
     """群里的 help：默认按身份分块，被点名的群只讲漂流瓶。"""
-    if group_id in BOTTLE_ONLY_HELP_GROUP_IDS:
+    if group_id in BOTTLE_ONLY_HELP_GROUP_IDS or group_id in BOTTLE_ONLY_GROUP_IDS:
         return bottle_help()
     return command_help(is_admin=is_admin)
 
@@ -344,6 +363,9 @@ def private_help(*, is_super: bool) -> str:
         commands += [
             "撤回记录 全部 —— 所有还没看过的撤回消息（不限时间）",
             "撤回记录 全部 50 —— 全部里只看最近的 50 条",
+            "撤回记录 历史 —— 所有已经撤回的消息（含看过的，默认全部群）",
+            "撤回记录 历史 <群号> —— 只看那个群的全部撤回历史",
+            "撤回记录 历史 50 —— 只看最近 50 条",
             "clear —— 清掉还没看过的撤回记录（只有主人能用）",
         ]
     blocks = ["这里可莉只认撤回记录相关的命令哦。", "", "【能用的命令】", _bullets(commands)]
@@ -393,6 +415,10 @@ def recall_cooldown_reply(remaining: int) -> str:
         f"这个群刚刚才翻过一遍，还要等 {remaining} 秒才能再翻哦～"
         f"（撤回记录是整个群共用 {GROUP_RECALL_COOLDOWN_SECONDS} 秒一次）"
     )
+
+
+def recall_history_owner_only_reply() -> str:
+    return "「撤回记录 历史」只留给主人哦，普通管理员看不到全部群的完整撤回记录。"
 
 
 def recall_all_refused_reply() -> str:
@@ -553,6 +579,7 @@ async def on_bot_connect(bot: Bot) -> None:
     mark_bot_connected()
     schedule_avatar_warm(bot)
     start_archive_sweeper(bot)
+    start_bottle_cache_warmer(bot)
     water.start_water_scheduler(bot)
 
 
@@ -668,6 +695,7 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         return
     await save_message(bot, event)
 
+    bottle_only = event.group_id in BOTTLE_ONLY_GROUP_IDS
     original_message = getattr(event, "original_message", event.get_message())
     is_admin = is_authorized(event.group_id, event.user_id)
     is_super = is_super_admin(event.user_id)
@@ -678,6 +706,8 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         if segment.type == "text"
     )
     if only_text_segments and exact_text == "!recalled":
+        if bottle_only:
+            return
         await serve_recall_query(
             bot, event, RecallCommand(False, False, None, None), is_super=is_super
         )
@@ -697,6 +727,10 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
             return
         text = textual
     folded = text.casefold()
+
+    # 只开漂流瓶的群：撤回记录、总结、点歌、私聊投递等全部静默。
+    if bottle_only and not bottle_only_allowed(text, folded):
+        return
 
     # Private ops command: only the owner's QQ numbers get an answer, everyone
     # else is ignored (and silently, without spending a cooldown slot).
@@ -725,6 +759,9 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     # one query would also block that member's 总结/help for two minutes.
     recall_command = parse_recall_command(text)
     if recall_command is not None:
+        # 「历史」只允许主人在私聊里看；群里完全静默。
+        if recall_command.history:
+            return
         await serve_recall_query(bot, event, recall_command, is_super=is_super)
         return
 
@@ -987,6 +1024,32 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
     if not await is_switch_on(RECALL_PRIVATE_DELIVERY):
         await _reply_private(
             bot, event, private_delivery_disabled_reply(), group_id=context_group
+        )
+        return
+
+    if recall_command is not None and recall_command.history:
+        if not is_super_admin(user_id):
+            await _reply_private(
+                bot, event, recall_history_owner_only_reply(), group_id=context_group
+            )
+            return
+        explicit = recall_command.group_id
+        if explicit is not None and explicit not in ALLOWED_GROUP_IDS:
+            await _reply_private(
+                bot, event, recall_target_refused_reply(), group_id=context_group
+            )
+            return
+        groups = [explicit] if explicit is not None else sorted(ALLOWED_GROUP_IDS)
+        count = recall_command.count
+        if count is not None:
+            count = max(1, min(count, RECALL_MAX_COUNT))
+        await safe_send_all_recall_history(
+            bot,
+            RecallRequest(
+                group_id=groups[0], user_id=user_id, private=True, from_group=False
+            ),
+            count,
+            groups=groups,
         )
         return
 

@@ -310,6 +310,9 @@ async def send_recall_history(
     count: int | None,
     *,
     all_pending: bool = False,
+    include_summoned: bool = False,
+    mark_summoned: bool = True,
+    silent_empty: bool = False,
 ) -> int:
     """Send not-yet-summoned recalls as images; return how many were drawn.
 
@@ -317,6 +320,11 @@ async def send_recall_history(
     shown; ``all_pending`` (super admin only, gated in ``handlers``) lifts that
     limit.  Either way only the rows actually drawn are marked as summoned, so
     older records stay pending for a later "全部" call.
+
+    ``include_summoned`` + ``mark_summoned=False`` is the private owner-only
+    "历史" mode: every recalled message is shown, already-seen ones included,
+    and nothing is marked.  ``silent_empty`` lets the all-groups loop skip a
+    group that has no history instead of sending an empty notice per group.
 
     The return value is what the caller needs to decide whether a short "already
     sent it to your private chat" notice is warranted; 0 means nothing was
@@ -330,8 +338,10 @@ async def send_recall_history(
                               m.sender_name, m.plain_text, m.sent_at, m.message_json
                        FROM recall_events e JOIN messages m
                          ON m.group_id=e.group_id AND m.message_id=e.message_id
-                       WHERE e.group_id=? AND e.summoned_at IS NULL"""
+                       WHERE e.group_id=?"""
             params: list[Any] = [group_id]
+            if not include_summoned:
+                query += " AND e.summoned_at IS NULL"
             if not all_pending:
                 query += " AND e.recalled_at>=?"
                 params.append(recall_window_cutoff())
@@ -347,6 +357,8 @@ async def send_recall_history(
         if count is not None:
             rows.reverse()
         if not rows:
+            if silent_empty:
+                return 0
             await send_notice(bot, request, empty_recall_text(recent, total, all_pending))
             return 0
 
@@ -484,11 +496,14 @@ async def send_recall_history(
                     raise RuntimeError("OneBot failed to send recall image")
                 await send_recall_videos(bot, request, chunk)
                 await send_recall_files(bot, request, chunk)
-                summoned_count += await _mark_summoned(
-                    group_id,
-                    [int(row["event_id"]) for row in chunk],
-                    datetime.now(timezone.utc).isoformat(),
-                )
+                if mark_summoned:
+                    summoned_count += await _mark_summoned(
+                        group_id,
+                        [int(row["event_id"]) for row in chunk],
+                        datetime.now(timezone.utc).isoformat(),
+                    )
+                else:
+                    summoned_count += len(chunk)
         except Exception:
             logger.exception("Could not send recall image batch")
             await send_notice(
@@ -525,6 +540,63 @@ async def safe_send_recall_history(
             bot,
             request,
             "可莉的撤回记录处理失败了，请稍后再试；详细错误已记入机器人日志。",
+        ),
+    )
+    return 0 if sent is None else sent
+
+
+async def send_all_recall_history(
+    bot: Bot,
+    request: RecallRequest,
+    count: int | None,
+    *,
+    groups: list[int],
+) -> int:
+    """Owner-only private history: every recall, seen or not, across groups.
+
+    Each group is sent as its own card set so avatars, group names and archived
+    media stay scoped to the right group.  Nothing is marked as summoned: this
+    is an audit view, not "consume the pending queue".
+    """
+    total = 0
+    for group_id in groups:
+        remaining = None if count is None else max(0, count - total)
+        if remaining == 0:
+            break
+        sub_request = RecallRequest(
+            group_id=group_id,
+            user_id=request.user_id,
+            private=True,
+            from_group=False,
+        )
+        total += await send_recall_history(
+            bot,
+            sub_request,
+            remaining,
+            all_pending=True,
+            include_summoned=True,
+            mark_summoned=False,
+            silent_empty=True,
+        )
+    if total == 0:
+        await send_notice(bot, request, "没有找到任何撤回记录哦。")
+    return total
+
+
+async def safe_send_all_recall_history(
+    bot: Bot,
+    request: RecallRequest,
+    count: int | None,
+    *,
+    groups: list[int],
+) -> int:
+    sent = await guard(
+        "Recall all-history handler",
+        lambda: send_all_recall_history(bot, request, count, groups=groups),
+        on_error=lambda: send_notice(
+            bot,
+            request,
+            "可莉的撤回历史处理失败了，请稍后再试；详细错误已记入机器人日志。",
         ),
     )
     return 0 if sent is None else sent

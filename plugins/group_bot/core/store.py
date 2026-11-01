@@ -379,4 +379,9 @@ async def initialize_database() -> None:
         cursor = await db.execute("PRAGMA table_info(messages)")
         if "archived_at" not in {str(row["name"]) for row in await cursor.fetchall()}:
             await db.execute("ALTER TABLE messages ADD COLUMN archived_at TEXT")
+        # 补扫只关心“还没归档”的行；全表扫描 + 临时排序会随消息量线性变慢。
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_archive_pending "
+            "ON messages(sent_at DESC) WHERE archived_at IS NULL"
+        )
         await db.commit()

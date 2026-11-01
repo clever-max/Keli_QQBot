@@ -161,34 +161,28 @@ def normalize_cached_image(content: bytes, destination: Path) -> bool:
         return False
 
 
-async def _fill_from_archive(
-    group_id: int | str, message_id: str, part_index: int, destination: Path
-) -> bool:
-    """归档里已有这张图就直接复制过来，不再打网络。
+async def _archived_images(
+    group_id: int | str, message_id: str
+) -> dict[int, tuple[str, str]]:
+    """All successfully archived images of one message, in one query.
 
-    2026-10-18 的收敛：`media_archive/` 是**唯一权威副本**（内容寻址、永久保存），
-    `media_cache/` 降级成**可随时删除的渲染缓存**——缺了就从归档复制，复制不到才联网。
-    这样新消息不会再写两份，旧消息已有的缓存文件继续有效。
+    Previously ``_fill_from_archive`` opened a new SQLite connection per image;
+    a 9-image message meant 9 connections before any rendering happened.
     """
-    from .archive import stored_path
     from ..core.store import connect
 
     async with connect() as db:
         cursor = await db.execute(
-            """SELECT sha256, suffix FROM message_media
-               WHERE group_id=? AND message_id=? AND part_index=? AND kind='image'
-                 AND error=''""",
-            (str(group_id), str(message_id), part_index),
+            """SELECT part_index, sha256, suffix FROM message_media
+               WHERE group_id=? AND message_id=? AND kind='image'
+                 AND error='' AND sha256<>''""",
+            (str(group_id), str(message_id)),
         )
-        row = await cursor.fetchone()
-    if not row or not row["sha256"]:
-        return False
-    source = stored_path(str(row["sha256"]), str(row["suffix"]) or ".jpg")
-    if not source.is_file():
-        return False
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    await asyncio.to_thread(shutil.copyfile, source, destination)
-    return True
+        rows = await cursor.fetchall()
+    return {
+        int(row["part_index"]): (str(row["sha256"]), str(row["suffix"]) or ".jpg")
+        for row in rows
+    }
 
 
 async def cache_message_images(
@@ -199,18 +193,31 @@ async def cache_message_images(
     client: httpx.AsyncClient,
     extra_suffixes: tuple[str, ...] = (),
 ) -> None:
+    from .archive import stored_path
+
     file_key = hashlib.sha256(f"{group_id}:{message_id}".encode("utf-8")).hexdigest()[:32]
-    for index, segment in enumerate(message_data):
-        if segment.get("type") != "image":
-            continue
+    image_indexes = [
+        index for index, segment in enumerate(message_data) if segment.get("type") == "image"
+    ]
+    archived = await _archived_images(group_id, str(message_id)) if image_indexes else {}
+    for index in image_indexes:
+        segment = message_data[index]
         segment_data = segment.setdefault("data", {})
         if segment_data.get("cached_path"):
             continue
         relative_path = Path("media_cache") / f"{file_key}_{index}.jpg"
         destination = DB_PATH.parent / relative_path
-        if await _fill_from_archive(group_id, str(message_id), index, destination):
-            segment_data["cached_path"] = relative_path.as_posix()
-            continue
+        archived_row = archived.get(index)
+        if archived_row:
+            source = stored_path(archived_row[0], archived_row[1])
+            if source.is_file():
+                try:
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    await asyncio.to_thread(shutil.copyfile, source, destination)
+                    segment_data["cached_path"] = relative_path.as_posix()
+                    continue
+                except OSError:
+                    logger.debug("Could not copy archived image {}", source, exc_info=True)
         content = await image_bytes_from_segment(bot, segment_data, client, extra_suffixes)
         if not content:
             continue

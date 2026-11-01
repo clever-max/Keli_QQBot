@@ -34,7 +34,31 @@
 <!-- ITERATION-INSERT-POINT 新迭代追加在这行下面，最新的在最上面 -->
 
 
+## [迭代 35] - 2026-11-01 — `d4dce28`
 
+可运行验证：`python -m compileall plugins` 通过；24/24 行为套件通过；`nonebot.init()` + `load_plugins("plugins")` 成功加载 ['group_bot']。
+
+### 新增
+
+- 只开漂流瓶的群只保留漂流瓶系列命令（`BOTTLE_ONLY_GROUP_IDS`）。
+- 主人私聊 `撤回记录 历史`：跨群返回所有已撤回消息（含已看过的），不标记未读。
+- 字体回退补泰文/拉丁语音扩展，归档 3,732 个字符覆盖率 100%。
+
+### 优化
+
+- 成功抽取不再调用 `pool_sizes`，只使用已拉取池子的 `pool_total`。
+- 连接后后台预热精华/相册缓存，重连时替换旧 Bot 的预热任务。
+- 图片归档查询按消息批量；相册照片缓存复用。
+- 归档 sha256 移出事件循环、临时文件原子写、共享 HTTP client。
+- 新增 `messages(archived_at)` 部分索引，补扫查询 17 ms → 0.007 ms。
+- 慢抽取记录 choose/select/render/send 分段日志。
+
+### 文档
+
+- 合并 8 份旧规划/评估文档，并标记本轮完成状态。
+- 同步 README、docs 索引、架构、命令、配置、开发、运维中的链接与过期数据。
+
+本迭代由 4 个解耦提交组成：`d4dce28`（功能）、`2efcc23`（性能）、`7d92b74`（字体）、随后一条 `docs` 提交。
 
 ## [迭代 34] - 2026-10-24 — `373717d`
 
@@ -386,3 +410,4 @@ PASS  4abda22  loaded=[group_bot]  Stop tracking the local data backup archive
 ```
 
 迭代 9–12 是同一天新提交的，验证在提交前于工作区直接完成，同样全部通过。
+

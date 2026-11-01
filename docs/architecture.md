@@ -135,6 +135,6 @@
 
 ## 7. 读代码时需要留意的既有约束
 
-- `messages.message_id` 是**全局主键**（不是 `(group_id, message_id)`），写入用 `INSERT OR IGNORE`。OneBot 的消息号实际上全局唯一，所以一直没出问题，但跨群撞号会被静默忽略。
-- `media.py` 的所有失败路径都返回 `None` 或只记日志，不抛异常——这是网络抖动不会拖垮机器人的原因，改这个模块时请保持。
+- `messages` 的主键是 **`(group_id, message_id)`**；跨群同号不会互相覆盖。按单独 `message_id` 查时走 `idx_messages_message_id`，不要假设复合主键的隐式索引能帮上忙。
+- `media/` 的失败路径返回 `None` 或只记日志，不抛异常——这是网络抖动不会拖垮机器人的原因，改这个模块时请保持。
 - 两套冷却时长（`COOLDOWN_SECONDS`、`GROUP_RECALL_COOLDOWN_SECONDS`）是**代码常量**而非 `.env` 项，见 [configuration.md](configuration.md)。

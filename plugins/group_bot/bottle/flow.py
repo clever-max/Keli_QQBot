@@ -459,6 +459,7 @@ async def send_bottle(
     with the mixed form because it is still one bottle.
     """
     group_id = int(event.group_id)
+    started_at = time.perf_counter()
     verdict = await claim_essence_draw(group_id, event.user_id)
     if verdict.kind == "cooldown":
         # One notice per cooldown window, then silence.
@@ -479,7 +480,17 @@ async def send_bottle(
 
     day = local_day_key()
     chosen = await choose_bottle(bot, group_id, day=day, album_only=album_only)
-    if album_only:
+    chosen_at = time.perf_counter()
+    if chosen.item is not None:
+        # choose_bottle already fetched the selected pool, and pool_total carries
+        # its size.  Do NOT call pool_sizes() here: that would fetch the other
+        # pool again, and on a cold album cache costs seconds for a number that
+        # only appears in the hint.
+        if chosen.kind == "album":
+            essence_total, album_total = 0, chosen.pool_total
+        else:
+            essence_total, album_total = chosen.pool_total, 0
+    elif album_only:
         # 只要相册时不必为了报个数去拉精华列表（冷缓存下那是 1-3 秒）。
         essence_total, album_total = 0, await album_pool_size(bot, group_id)
     else:
@@ -607,6 +618,7 @@ async def send_bottle(
             logger.debug("Could not cache bottle sender avatar", exc_info=True)
 
     path = None
+    pre_render_at = time.perf_counter()
     try:
         # 渲染是纯 CPU 活（960px 卡片实测 157–455 ms），放线程里跑，别占住事件循环
         # ——否则这段时间内 NapCat 的其它事件（心跳、别的群消息）只能排队。
@@ -624,6 +636,17 @@ async def send_bottle(
         )
         if isinstance(result, dict) and result.get("status") == "failed":
             raise RuntimeError("OneBot failed to send the bottle card")
+        finished_at = time.perf_counter()
+        if finished_at - started_at > 1.0:
+            logger.info(
+                "Bottle draw timing group={} kind={} choose={:.2f}s pre={:.2f}s render+send={:.2f}s total={:.2f}s",
+                group_id,
+                chosen.kind,
+                chosen_at - started_at,
+                pre_render_at - chosen_at,
+                finished_at - pre_render_at,
+                finished_at - started_at,
+            )
     except Exception:
         logger.exception("Could not send the bottle card")
         await refund_essence_draw(group_id, event.user_id)

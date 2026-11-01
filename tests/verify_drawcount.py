@@ -289,6 +289,7 @@ async def check_send_bottle_records_label() -> None:
         return chosen_essence(message_id="__e2e__", text="端到端测试正文")
 
     async def fixed_sizes(bot, group_id):
+        pool_size_calls.append(1)
         return (1, 0)
 
     def fake_renderer(chosen, group_id, group_name, *, essence_total, album_total, drawn_times=0):
@@ -299,6 +300,7 @@ async def check_send_bottle_records_label() -> None:
 
     await clear("__e2e__")
     captured_times: list[int] = []
+    pool_size_calls: list[int] = []
     saved = (gb.claim_essence_draw, gb.choose_bottle, gb.pool_sizes, gb.render_bottle_card)
     gb_flow.claim_essence_draw = ok_draw
     gb_flow.choose_bottle = fixed_choose
@@ -309,6 +311,7 @@ async def check_send_bottle_records_label() -> None:
         event = SimpleNamespace(group_id=GROUP, user_id=777777777, group_name="测试群")
         await send_bottle(bot, event)
         check("首次抽取时卡片拿到 drawn_times=1", captured_times, [1])
+        check("成功抽取不再调用 pool_sizes", pool_size_calls, [])
         check("数据库里已有 1 条记录", await draw_times(GROUP, "__e2e__"), 1)
         async with connect() as db:
             cursor = await db.execute(
